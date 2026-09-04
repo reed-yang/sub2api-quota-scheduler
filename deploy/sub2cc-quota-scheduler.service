@@ -1,0 +1,17 @@
+[Unit]
+Description=sub2cc 7-day quota scheduler for sub2api group xb
+After=network.target sub2api.service
+Wants=sub2api.service
+
+[Service]
+Type=oneshot
+DynamicUser=yes
+StateDirectory=sub2cc-scheduler
+EnvironmentFile=/etc/sub2cc-scheduler/env
+ExecStart=/opt/sub2cc-scheduler/sub2cc-quota-scheduler run --config /etc/sub2cc-scheduler/config.json
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+IPAddressAllow=127.0.0.1
+IPAddressDeny=any

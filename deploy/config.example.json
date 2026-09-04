@@ -1,0 +1,19 @@
+{
+  "base_url": "http://127.0.0.1:8080",
+  "admin_key_env": "SUB2CC_SCHEDULER_ADMIN_KEY",
+  "mode": "shadow",
+  "group_id": 12,
+  "lookahead_hours": 72,
+  "min_urgent_headroom_percent": 5,
+  "hysteresis_ratio": 0.2,
+  "default_ceiling_percent": 95,
+  "default_fable_ceiling_percent": 95,
+  "fable_model_pattern": "claude-fable-*",
+  "accounts": [
+    { "id": 9, "name": "relay", "kind": "relay" },
+    { "id": 11, "name": "ying", "kind": "subscription" },
+    { "id": 4, "name": "xb-claude", "kind": "subscription" },
+    { "id": 8, "name": "my-team", "kind": "subscription" },
+    { "id": 1, "name": "my-sub", "kind": "subscription", "ceiling_percent": 60, "fable_ceiling_percent": 80, "enforce_ceiling": true }
+  ]
+}

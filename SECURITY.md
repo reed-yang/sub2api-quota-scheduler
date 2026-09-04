@@ -6,7 +6,7 @@ The scheduler holds a sub2api **admin API key**. Whoever has that key can
 change any account or setting in your sub2api instance. The deployment in
 `deploy/` is designed around that:
 
-- The key lives in `/etc/sub2cc-scheduler/env`, `root:root`, mode `0600`,
+- The key lives in `/etc/sub2api-quota-scheduler/env`, `root:root`, mode `0600`,
   and is handed to the process by systemd through `EnvironmentFile`.
 - The service runs as a dynamic unprivileged user with `ProtectSystem=strict`,
   `ProtectHome=yes`, `NoNewPrivileges=yes`, and may only connect to

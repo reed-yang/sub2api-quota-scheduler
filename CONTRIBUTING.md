@@ -30,7 +30,7 @@ keep it that way are very welcome.
 
 sub2api moves quickly. If an admin API field or endpoint changed, please
 include the sub2api version, the request the scheduler made (redact the key),
-and the response body. `journalctl -u sub2cc-quota-scheduler` has everything
+and the response body. `journalctl -u sub2api-quota-scheduler` has everything
 except the key.
 
 ## Ideas that fit the scope

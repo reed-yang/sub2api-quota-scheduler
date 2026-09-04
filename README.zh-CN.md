@@ -1,4 +1,4 @@
-# sub2cc-quota-scheduler
+# sub2api-quota-scheduler
 
 [English](README.md)
 
@@ -13,7 +13,7 @@
 
 ## 现状
 
-自 2026-09-04 起在一个五账号 Claude 分组上生产运行，已对 sub2api **v0.2.0** 验证。这是独立的社区项目，与 sub2api 维护者无关。
+新项目：自 2026-09-04 起以 apply 模式跑在一个五账号 Claude 分组上，难免有毛边，欢迎反馈。已在 sub2api **v0.2.0** 上测试。这是独立的社区项目，与 sub2api 维护者无关。
 
 ## 痛点
 
@@ -51,22 +51,22 @@ sub2api v0.2.0 自己回答不了这个问题：
 
 ## 快速开始
 
-1. 从 [Releases](https://github.com/reed-yang/sub2cc-quota-scheduler/releases) 下载 `sub2cc-quota-scheduler-linux-amd64` 或 `-arm64`，或本地 `sh build.sh` 编译。
+1. 从 [Releases](https://github.com/reed-yang/sub2api-quota-scheduler/releases) 下载 `sub2api-quota-scheduler-linux-amd64` 或 `-arm64`，或本地 `sh build.sh` 编译。
 2. 在 sub2api 后台生成 admin API key。
 3. 复制 `deploy/config.example.json` 为 `config.json`，填 `group_id`、按偏好顺序列出账号 ID，需要保留的账号加上 `ceiling_percent` / `fable_ceiling_percent` / `enforce_ceiling`。`mode` 先保持 `shadow`。
-4. 把二进制（命名为 `sub2cc-quota-scheduler`）、`config.json`、`deploy/` 下两个 unit 文件和 `install.sh` 放到宿主机同一目录，然后：
+4. 把二进制（命名为 `sub2api-quota-scheduler`）、`config.json`、`deploy/` 下两个 unit 文件和 `install.sh` 放到宿主机同一目录，然后：
 
    ```sh
    sudo sh install.sh
-   sudo sh -c 'umask 077; echo "SUB2CC_SCHEDULER_ADMIN_KEY=admin-..." > /etc/sub2cc-scheduler/env'
-   sudo systemctl start sub2cc-quota-scheduler.service
-   journalctl -u sub2cc-quota-scheduler -n 3 -o cat
+   sudo sh -c 'umask 077; echo "SUB2API_QUOTA_SCHEDULER_ADMIN_KEY=admin-..." > /etc/sub2api-quota-scheduler/env'
+   sudo systemctl start sub2api-quota-scheduler.service
+   journalctl -u sub2api-quota-scheduler -n 3 -o cat
    ```
 
-5. 观察一段时间 `/var/lib/sub2cc-scheduler/decisions.jsonl` 里的 shadow 判定。
-6. 把 `/etc/sub2cc-scheduler/config.json` 里的 `mode` 改为 `apply`。
+5. 观察一段时间 shadow 判定：`sudo tail -n 1 /var/lib/sub2api-quota-scheduler/decisions.jsonl` 或 `journalctl -u sub2api-quota-scheduler -o cat`。
+6. 把 `/etc/sub2api-quota-scheduler/config.json` 里的 `mode` 改为 `apply`。
 
-回滚：`sudo systemctl disable --now sub2cc-quota-scheduler.timer`。优先级、可调度开关、分组路由都是普通字段，随时可在后台手改。
+回滚：`sudo systemctl disable --now sub2api-quota-scheduler.timer`。优先级、可调度开关、分组路由都是普通字段，随时可在后台手改。
 
 ## 配置项
 

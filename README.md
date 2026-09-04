@@ -1,10 +1,10 @@
-# sub2cc-quota-scheduler
+# sub2api-quota-scheduler
 
-[![CI](https://github.com/reed-yang/sub2cc-quota-scheduler/actions/workflows/ci.yml/badge.svg)](https://github.com/reed-yang/sub2cc-quota-scheduler/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/reed-yang/sub2cc-quota-scheduler)](https://github.com/reed-yang/sub2cc-quota-scheduler/releases)
+[![CI](https://github.com/reed-yang/sub2api-quota-scheduler/actions/workflows/ci.yml/badge.svg)](https://github.com/reed-yang/sub2api-quota-scheduler/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/reed-yang/sub2api-quota-scheduler)](https://github.com/reed-yang/sub2api-quota-scheduler/releases)
 [![Go](https://img.shields.io/badge/go-1.22%2B-00ADD8?logo=go)](go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![sub2api](https://img.shields.io/badge/sub2api-v0.2.0%20verified-blue)](https://github.com/Wei-Shaw/sub2api)
+[![sub2api](https://img.shields.io/badge/tested%20with-sub2api%20v0.2.0-blue)](https://github.com/Wei-Shaw/sub2api)
 
 **Spend expiring Claude 7-day quota first.** A sidecar for
 [sub2api](https://github.com/Wei-Shaw/sub2api) that reorders the accounts of
@@ -23,8 +23,9 @@ on one account, using nothing but the sub2api admin API.
 
 ## Status
 
-Production use since 2026-09-04 on a five-account Claude group. Verified
-against sub2api **v0.2.0**; the admin endpoints it relies on are listed under
+Young project: running in apply mode on a five-account Claude group since
+2026-09-04, so expect rough edges and please report them. Tested against
+sub2api **v0.2.0**; the admin endpoints it relies on are listed under
 [Compatibility](#compatibility). This is an independent community project
 and is not affiliated with the sub2api maintainers.
 
@@ -127,14 +128,14 @@ future moment with `plan --now`.
 ## Quick start
 
 Requirements: Go 1.22+ on your workstation (or a
-[release binary](https://github.com/reed-yang/sub2cc-quota-scheduler/releases)),
+[release binary](https://github.com/reed-yang/sub2api-quota-scheduler/releases)),
 sub2api v0.2.0 or compatible on the host, nothing else.
 
-1. **Get the binary.** Download `sub2cc-quota-scheduler-linux-amd64` (or
+1. **Get the binary.** Download `sub2api-quota-scheduler-linux-amd64` (or
    `-arm64`) from the releases page, or build it:
 
    ```sh
-   sh build.sh          # dist/sub2cc-quota-scheduler, static linux/amd64
+   sh build.sh          # dist/sub2api-quota-scheduler, static linux/amd64
    ```
 
 2. **Create an admin API key** in the sub2api admin UI (Settings, Admin API
@@ -145,33 +146,33 @@ sub2api v0.2.0 or compatible on the host, nothing else.
    set `group_id`, list the account IDs in your preferred base order, and add
    per-account ceilings where you want a reserve. Leave `mode` as `shadow`.
 
-4. **Install on the host.** Put the binary (named `sub2cc-quota-scheduler`),
-   `config.json`, both unit files from `deploy/`, and `deploy/install.sh` in
-   one directory, then:
+4. **Install on the host.** Put the binary (the release asset name works as
+   is), `config.json`, both unit files from `deploy/`, and `deploy/install.sh`
+   in one directory, then:
 
    ```sh
    sudo sh install.sh
-   sudo sh -c 'umask 077; echo "SUB2CC_SCHEDULER_ADMIN_KEY=admin-..." > /etc/sub2cc-scheduler/env'
-   sudo systemctl start sub2cc-quota-scheduler.service
-   journalctl -u sub2cc-quota-scheduler -n 3 -o cat
+   sudo sh -c 'umask 077; echo "SUB2API_QUOTA_SCHEDULER_ADMIN_KEY=admin-..." > /etc/sub2api-quota-scheduler/env'
+   sudo systemctl start sub2api-quota-scheduler.service
+   journalctl -u sub2api-quota-scheduler -n 3 -o cat
    ```
 
-   The installer copies the binary to `/opt/sub2cc-scheduler`, the config to
-   `/etc/sub2cc-scheduler/config.json`, and enables the timer. The service
+   The installer copies the binary to `/opt/sub2api-quota-scheduler`, the config to
+   `/etc/sub2api-quota-scheduler/config.json`, and enables the timer. The service
    runs as a dynamic unprivileged user, may only reach `127.0.0.1`, and keeps
-   its state in `/var/lib/sub2cc-scheduler`.
+   its state in `/var/lib/sub2api-quota-scheduler`.
 
 5. **Watch shadow decisions** for a while:
 
    ```sh
-   tail -n 1 /var/lib/sub2cc-scheduler/decisions.jsonl | python3 -m json.tool
+   sudo tail -n 1 /var/lib/sub2api-quota-scheduler/decisions.jsonl | python3 -m json.tool
    ```
 
 6. **Enable writes** by changing `"mode": "shadow"` to `"mode": "apply"` in
-   `/etc/sub2cc-scheduler/config.json`. The next run applies the actions; a
+   `/etc/sub2api-quota-scheduler/config.json`. The next run applies the actions; a
    run with nothing to change performs no writes.
 
-Rollback at any time: `sudo systemctl disable --now sub2cc-quota-scheduler.timer`.
+Rollback at any time: `sudo systemctl disable --now sub2api-quota-scheduler.timer`.
 Priorities, the schedulable flag, and group routing remain ordinary fields
 you can edit in the sub2api admin UI.
 
@@ -182,7 +183,7 @@ See [`deploy/config.example.json`](deploy/config.example.json).
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `base_url` | `http://127.0.0.1:8080` | sub2api address; keep it on loopback |
-| `admin_key_env` | `SUB2CC_SCHEDULER_ADMIN_KEY` | environment variable that holds the admin API key |
+| `admin_key_env` | `SUB2API_QUOTA_SCHEDULER_ADMIN_KEY` | environment variable that holds the admin API key |
 | `mode` | `shadow` | `shadow` logs only; `apply` writes |
 | `group_id` | required | the sub2api group whose accounts are managed |
 | `lookahead_hours` | `72` | how early an expiring window becomes urgent |
@@ -199,9 +200,9 @@ base order. Only the listed accounts are ever read for policy or written.
 ## Commands
 
 ```sh
-sub2cc-quota-scheduler run  --config /etc/sub2cc-scheduler/config.json
-sub2cc-quota-scheduler plan --config /etc/sub2cc-scheduler/config.json --state-dir /tmp/qs --now 2026-09-05T05:30:00Z
-sub2cc-quota-scheduler version
+sub2api-quota-scheduler run  --config /etc/sub2api-quota-scheduler/config.json
+sub2api-quota-scheduler plan --config /etc/sub2api-quota-scheduler/config.json --state-dir /tmp/qs --now 2026-09-05T05:30:00Z
+sub2api-quota-scheduler version
 ```
 
 `plan` never writes, whatever the config says, and accepts `--now` to preview
@@ -227,7 +228,7 @@ a future point in time against live data. `--state-dir` defaults to systemd's
 
 | sub2api | Status |
 | --- | --- |
-| v0.2.0 | Verified in production |
+| v0.2.0 | Tested; in daily use by the author |
 | Older 0.1.x | Untested; the admin endpoints above existed for a while but check `extra` field names |
 | Newer | Please report; if upstream ships native reset-aware scheduling this project can retire |
 
@@ -271,7 +272,7 @@ anything drifts.
 No. Loopback HTTP to the admin API is the only dependency.
 
 **Can I run it from cron instead of systemd?**
-Yes: run `sub2cc-quota-scheduler run --config ... --state-dir <dir>` with the
+Yes: run `sub2api-quota-scheduler run --config ... --state-dir <dir>` with the
 key in the environment. The systemd unit just adds sandboxing.
 
 ## Contributing

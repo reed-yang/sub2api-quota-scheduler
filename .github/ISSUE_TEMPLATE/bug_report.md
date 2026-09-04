@@ -5,7 +5,7 @@ labels: bug
 ---
 
 **sub2api version**: 
-**sub2cc-quota-scheduler version** (`sub2cc-quota-scheduler version`): 
+**sub2api-quota-scheduler version** (`sub2api-quota-scheduler version`): 
 **Mode**: shadow / apply
 
 **What happened**
@@ -17,7 +17,7 @@ labels: bug
 ```json
 ```
 
-**Journal** (`journalctl -u sub2cc-quota-scheduler -n 20 -o cat`, redacted):
+**Journal** (`journalctl -u sub2api-quota-scheduler -n 20 -o cat`, redacted):
 
 ```
 ```

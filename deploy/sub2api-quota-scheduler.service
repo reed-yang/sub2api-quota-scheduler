@@ -1,0 +1,17 @@
+[Unit]
+Description=sub2api-quota-scheduler: 7-day-quota-aware account ordering for sub2api
+After=network.target sub2api.service
+Wants=sub2api.service
+
+[Service]
+Type=oneshot
+DynamicUser=yes
+StateDirectory=sub2api-quota-scheduler
+EnvironmentFile=/etc/sub2api-quota-scheduler/env
+ExecStart=/opt/sub2api-quota-scheduler/sub2api-quota-scheduler run --config /etc/sub2api-quota-scheduler/config.json
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+IPAddressAllow=127.0.0.1
+IPAddressDeny=any

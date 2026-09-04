@@ -1,5 +1,5 @@
 [Unit]
-Description=Run the sub2cc quota scheduler every five minutes
+Description=Run sub2api-quota-scheduler every five minutes
 
 [Timer]
 OnBootSec=2min

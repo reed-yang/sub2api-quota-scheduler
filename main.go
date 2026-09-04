@@ -11,7 +11,7 @@ import (
 )
 
 // version is overridden at release time via -ldflags "-X main.version=...".
-var version = "0.1.0"
+var version = "0.1.1"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -20,7 +20,7 @@ func main() {
 	}
 	switch os.Args[1] {
 	case "version":
-		fmt.Println("sub2cc-quota-scheduler " + version)
+		fmt.Println("sub2api-quota-scheduler " + version)
 	case "run", "plan":
 		if err := command(os.Args[1], os.Args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)
@@ -33,12 +33,12 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: sub2cc-quota-scheduler run|plan --config <path> [--state-dir <dir>] [--now RFC3339] | version")
+	fmt.Fprintln(os.Stderr, "usage: sub2api-quota-scheduler run|plan --config <path> [--state-dir <dir>] [--now RFC3339] | version")
 }
 
 func command(name string, args []string) error {
 	fs := flag.NewFlagSet(name, flag.ContinueOnError)
-	configPath := fs.String("config", "/etc/sub2cc-scheduler/config.json", "config file")
+	configPath := fs.String("config", "/etc/sub2api-quota-scheduler/config.json", "config file")
 	stateDir := fs.String("state-dir", os.Getenv("STATE_DIRECTORY"), "state directory (defaults to $STATE_DIRECTORY)")
 	nowFlag := fs.String("now", "", "override current time (RFC3339) for planning")
 	if err := fs.Parse(args); err != nil {

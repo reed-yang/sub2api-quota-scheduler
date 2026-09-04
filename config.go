@@ -54,7 +54,7 @@ func (c *Config) applyDefaults() {
 		c.BaseURL = "http://127.0.0.1:8080"
 	}
 	if c.AdminKeyEnv == "" {
-		c.AdminKeyEnv = "SUB2CC_SCHEDULER_ADMIN_KEY"
+		c.AdminKeyEnv = "SUB2API_QUOTA_SCHEDULER_ADMIN_KEY"
 	}
 	if c.Mode == "" {
 		c.Mode = "shadow"

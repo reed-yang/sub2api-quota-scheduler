@@ -1,6 +1,8 @@
 name: ci
 on:
   push:
+    branches: [main]
+    tags: ["v*"]
   pull_request:
 jobs:
   test:
@@ -13,5 +15,13 @@ jobs:
       - run: test -z "$(gofmt -l .)"
       - run: go vet ./...
       - run: go test ./...
-      - run: sh -n build.sh && sh -n deploy/install.sh
-      - run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o /tmp/sub2cc-quota-scheduler .
+      - run: sh -n build.sh && sh -n deploy/install.sh && sh -n deploy/migrate-from-0.1.0.sh
+      - name: Deployment names stay consistent
+        run: |
+          grep -q '^ExecStart=/opt/sub2api-quota-scheduler/sub2api-quota-scheduler run' deploy/sub2api-quota-scheduler.service
+          grep -q '^StateDirectory=sub2api-quota-scheduler$' deploy/sub2api-quota-scheduler.service
+          grep -q '^EnvironmentFile=/etc/sub2api-quota-scheduler/env$' deploy/sub2api-quota-scheduler.service
+          grep -q 'NAME=sub2api-quota-scheduler' deploy/install.sh
+          grep -q '"admin_key_env": "SUB2API_QUOTA_SCHEDULER_ADMIN_KEY"' deploy/config.example.json
+          ! grep -rn --exclude-dir=.git --exclude=CHANGELOG.md --exclude=migrate-from-0.1.0.sh --exclude=install.sh 'sub2c[c]' .
+      - run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o /tmp/sub2api-quota-scheduler .

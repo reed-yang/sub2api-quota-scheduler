@@ -19,9 +19,9 @@ jobs:
           for arch in amd64 arm64; do
             CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath \
               -ldflags "-s -w -X main.version=${GITHUB_REF_NAME#v}" \
-              -o "dist/sub2cc-quota-scheduler-linux-$arch" .
+              -o "dist/sub2api-quota-scheduler-linux-$arch" .
           done
-          cp deploy/config.example.json deploy/install.sh deploy/sub2cc-quota-scheduler.service deploy/sub2cc-quota-scheduler.timer dist/
+          cp deploy/config.example.json deploy/install.sh deploy/sub2api-quota-scheduler.service deploy/sub2api-quota-scheduler.timer dist/
           (cd dist && sha256sum * > checksums.txt)
       - uses: softprops/action-gh-release@v2
         with:

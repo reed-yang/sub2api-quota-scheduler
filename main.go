@@ -10,7 +10,8 @@ import (
 	"time"
 )
 
-const version = "0.1.0"
+// version is overridden at release time via -ldflags "-X main.version=...".
+var version = "0.1.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -97,7 +98,7 @@ func runOnce(ctx context.Context, cfg *Config, client *AdminClient, stateDir str
 			}
 		}
 	} else if len(d.Actions) > 0 {
-		d.Warnings = append(d.Warnings, "shadow mode: actions not applied")
+		d.Warnings = append(d.Warnings, fmt.Sprintf("dry run (mode=%s): actions not applied", cfg.Mode))
 	}
 	d.State.LastRun = now.UTC().Format(time.RFC3339)
 	if err := AppendDecision(stateDir, d); err != nil {

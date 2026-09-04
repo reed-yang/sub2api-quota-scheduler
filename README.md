@@ -1,133 +1,153 @@
 # sub2cc-quota-scheduler
 
-A tiny static Go binary that makes [sub2api](https://github.com/Wei-Shaw/sub2api)
-spend Claude subscription quota **before it expires**. It reorders the accounts
-of one sub2api group every five minutes based on each account's 7-day usage
-window and reset countdown, and it can reserve part of one account for your
-own use. It talks only to the sub2api admin API, so sub2api itself, its
-database, and its service are never modified.
+[![CI](https://github.com/reed-yang/sub2cc-quota-scheduler/actions/workflows/ci.yml/badge.svg)](https://github.com/reed-yang/sub2cc-quota-scheduler/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/reed-yang/sub2cc-quota-scheduler)](https://github.com/reed-yang/sub2cc-quota-scheduler/releases)
+[![Go](https://img.shields.io/badge/go-1.22%2B-00ADD8?logo=go)](go.mod)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![sub2api](https://img.shields.io/badge/sub2api-v0.2.0%20verified-blue)](https://github.com/Wei-Shaw/sub2api)
 
-- Standard library only, single ~6 MB static binary, ~3 MB RSS, ~30 ms per run.
+**Spend expiring Claude 7-day quota first.** A sidecar for
+[sub2api](https://github.com/Wei-Shaw/sub2api) that reorders the accounts of
+a group by *reset countdown and unused capacity*, and keeps a private reserve
+on one account, using nothing but the sub2api admin API.
+
+[中文说明](README.zh-CN.md)
+
+- Single static Go binary, standard library only, ~6 MB, ~3 MB RSS, ~30 ms per run.
 - Runs from a systemd timer next to sub2api; nothing to install on the host.
-- Shadow mode first: logs what it *would* change until you flip it to apply.
+- Shadow mode by default: it tells you what it *would* change until you flip it.
 - Never moves an existing sticky session by reordering; only the optional
   hard reserve can.
+- Zero changes to sub2api, its database, or its service. Disable the timer
+  and everything is back to ordinary sub2api behavior.
 
-## Motivation
+## Status
 
-Claude subscriptions (Max, Team, and similar) meter usage in a rolling
-**7-day window** that resets at a fixed time. Whatever you have not used when
-the window resets is gone. If you pool several subscriptions behind sub2api,
-the interesting question is therefore not "which account is cheapest" but
-"which account's unused capacity is about to vanish".
+Production use since 2026-09-04 on a five-account Claude group. Verified
+against sub2api **v0.2.0**; the admin endpoints it relies on are listed under
+[Compatibility](#compatibility). This is an independent community project
+and is not affiliated with the sub2api maintainers.
 
-sub2api v0.2.0 cannot answer that question on its own:
+## The problem
 
-- New sessions are assigned by a **static per-account priority**, then load,
-  then least-recently-used. The 7-day reset time is not a selection key.
-- Its optional `prefer_soonest_reset` looks only at the **5-hour** window.
-- It does record the Anthropic `7d` and `7d_oi` usage headers for every
-  account, and its threshold feature can pause an account above a percentage,
-  but that threshold is one number shared by all windows and all accounts.
-- Sticky sessions (one hour, refreshed on use) are honored before priority,
-  which is exactly what you want: a running coding session should not hop
-  between accounts and lose its prompt cache.
+Claude subscriptions (Max, Team, and similar) meter usage in a **7-day
+window** that resets at a fixed time. Unused capacity at reset is simply lost.
+When you pool several subscriptions behind sub2api, the useful question is not
+"which account is preferred" but "which account's unused capacity is about to
+vanish".
 
-The upstream feature request for reset-aware scheduling
-([Wei-Shaw/sub2api#5583](https://github.com/Wei-Shaw/sub2api/issues/5583))
-was open with no response at the time of writing. Forking sub2api to add an
-in-process scheduler means rebuilding and re-patching on every upstream
-release. This project takes the other route: a sidecar that uses the data
-sub2api already collects and the admin API it already exposes.
+sub2api v0.2.0 cannot answer that on its own:
+
+| What sub2api does | Consequence |
+| --- | --- |
+| New sessions pick the lowest **static priority**, then load, then LRU | The 7-day reset time is never a selection key |
+| `prefer_soonest_reset` compares the **5-hour** window only | Weekly capacity still expires unused |
+| It records the Anthropic `7d` / `7d_oi` headers per account | The data exists but nothing schedules on it |
+| Its threshold pauses an account above one percentage | One number for all windows and all accounts; no per-account reserve |
+| Sticky sessions (1 h, refreshed on use) outrank priority | Good: running sessions must not hop and lose their prompt cache |
+
+The upstream request for reset-aware scheduling,
+[Wei-Shaw/sub2api#5583](https://github.com/Wei-Shaw/sub2api/issues/5583), is
+open; related asks are
+[#979](https://github.com/Wei-Shaw/sub2api/issues/979) and
+[#5681](https://github.com/Wei-Shaw/sub2api/issues/5681). Forking sub2api
+means rebuilding and re-patching on every upstream release, and sub2api ships
+several releases a week. This project takes the sidecar route instead: use the
+data sub2api already collects and the admin API it already exposes.
 
 Two concrete needs drove the design:
 
-1. **Do not waste expiring capacity.** An account whose 7-day window resets
-   in a day and still has 70% unused should receive new sessions before an
-   account that resets next week, even if the operator's normal preference
-   says otherwise.
+1. **Do not waste expiring capacity.** An account that resets in a day with
+   70% unused should receive new sessions before an account that resets next
+   week, even if the operator's normal preference says otherwise.
 2. **Keep a private reserve.** One subscription is also used for the owner's
-   own chat. It must never be driven past a chosen usage level by gateway
-   traffic, with a separate, higher level for models that have their own
-   sub-window (the Anthropic `7d_oi` window used by Fable models).
+   own chat. Gateway traffic must never push it past a chosen level, with a
+   separate, higher level for models that have their own sub-window (the
+   Anthropic `7d_oi` window used by Fable-class models).
 
 ## How it works
 
 Every run (default: every five minutes):
 
-1. Fetch the group's accounts and the group's model routing through the admin
-   API. Abort without writing if any configured account is missing or not in
-   the group.
-2. Normalize each subscription's 7-day windows from the passive usage fields
-   sub2api stores in `extra`:
-   - `known`: utilization and a future reset timestamp.
-   - `rolled`: the recorded reset is in the past, so the window has rolled
-     over and no new sample has arrived yet; usage is treated as 0 and the
-     reset is advanced by whole weeks.
-   - `unknown`: fields missing (sub2api clears them at each new 5-hour
-     window until the next response is sampled); the account falls back to
-     the base order and never triggers a reserve action.
-3. Build the **urgent tier**: subscriptions whose reset is within
+1. **Fetch** the group's accounts and model routing through the admin API.
+   Abort without writing if any configured account is missing or not in the
+   group.
+2. **Normalize** each subscription's 7-day windows from the passive usage
+   fields sub2api stores in `extra`:
+   - `known`: utilization plus a future reset timestamp.
+   - `rolled`: the recorded reset is in the past, so the window rolled over
+     and no new sample has arrived; usage is treated as 0 and the reset is
+     advanced by whole weeks.
+   - `unknown`: fields missing (sub2api clears them at each new 5-hour window
+     until the next response is sampled); the account falls back to the base
+     order and never triggers a reserve action.
+3. **Rank the urgent tier**: subscriptions whose reset is within
    `lookahead_hours` and whose headroom below their ceiling is at least
-   `min_urgent_headroom_percent`. Rank them by
-   `pressure = headroom / hours_to_reset`, so "a lot left, little time" wins.
-   Two urgent accounts keep their previous relative order unless the higher
-   pressure exceeds the lower by more than `hysteresis_ratio`, which prevents
-   flapping.
-4. Target order = urgent tier, then every other account in the configured
-   base order. Positions become priorities `1..N`. Only accounts whose live
-   priority differs are written, with a request body containing nothing but
+   `min_urgent_headroom_percent`, ordered by
+   `pressure = headroom / hours_to_reset`. Two urgent accounts keep their
+   previous relative order unless the higher pressure exceeds the lower by
+   more than `hysteresis_ratio`, so the order does not flap.
+4. **Write priorities**: urgent tier first, then everyone else in the
+   configured base order, as priorities `1..N`. Only accounts whose live
+   priority differs are written, with a body containing nothing but
    `priority`.
-5. For accounts marked `enforce_ceiling`:
+5. **Enforce reserves** for accounts marked `enforce_ceiling`:
    - 7-day usage at or above `ceiling_percent`: set the account unschedulable
      until its window resets, then re-enable it. The scheduler remembers that
-     it was the one who disabled the account and never re-enables an account
-     an operator disabled by hand.
+     it disabled the account and never re-enables one an operator disabled by
+     hand.
    - Fable (`7d_oi`) usage at or above `fable_ceiling_percent`: install a
-     group model routing rule that sends `fable_model_pattern` to the other
-     configured accounts, and remove it after the reset. If the group already
-     has routing the scheduler did not write, it leaves it alone and warns.
-6. Print one JSON decision line, append it to `decisions.jsonl`, and persist
-   the small state file.
+     group routing rule that sends `fable_model_pattern` to the other
+     configured accounts, and remove it after the reset. Routing the
+     scheduler did not write is left alone with a warning.
+6. **Log** one JSON decision line to stdout and `decisions.jsonl`, and persist
+   a small state file.
 
-Everything that is *not* the reserve is soft: it only changes where **new**
-sessions land. sub2api's own sticky-session logic keeps existing sessions on
-their account, and its own rate-limit and threshold handling still applies on
-top.
+Everything except the reserve is soft: it only changes where **new** sessions
+land. sub2api's sticky-session logic keeps existing sessions on their account,
+and its own rate-limit and threshold handling still applies on top.
 
-A worked example from a live deployment (five accounts, base order
-`relay > sub-a > sub-b > team-plan > personal-max`):
+### Worked example
+
+Five accounts, base order `relay > sub-a > sub-b > team-plan > personal-max`,
+`personal-max` reserved at 60%:
 
 | Account | 7d used | Resets in | Headroom | Pressure | Result |
 | --- | ---: | ---: | ---: | ---: | --- |
 | team-plan | 25% | 21 h | 70 | 3.36 | urgent, priority 1 |
-| personal-max (ceiling 60) | 35% | 72 h | 25 | 0.35 | urgent, priority 2 |
+| personal-max | 35% | 72 h | 25 | 0.35 | urgent, priority 2 |
 | relay | n/a | n/a | | | base, priority 3 |
 | sub-a | 24% | 159 h | | | base, priority 4 |
 | sub-b | 33% | 123 h | | | base, priority 5 |
 
+When `team-plan` resets, it drops out of the urgent tier and `personal-max`
+moves to priority 1 until it reaches 60% or resets. You can preview any
+future moment with `plan --now`.
+
 ## Quick start
 
-Requirements: Go 1.22+ on your workstation to build; sub2api v0.2.0 or
-compatible on the target host; nothing else on the host.
+Requirements: Go 1.22+ on your workstation (or a
+[release binary](https://github.com/reed-yang/sub2cc-quota-scheduler/releases)),
+sub2api v0.2.0 or compatible on the host, nothing else.
 
-1. **Build** a static `linux/amd64` binary:
+1. **Get the binary.** Download `sub2cc-quota-scheduler-linux-amd64` (or
+   `-arm64`) from the releases page, or build it:
 
    ```sh
-   sh build.sh          # writes dist/sub2cc-quota-scheduler
+   sh build.sh          # dist/sub2cc-quota-scheduler, static linux/amd64
    ```
 
-2. **Create an admin API key** in the sub2api admin UI (Settings, admin API
-   key, regenerate). Optionally set the platform scheduling threshold there
-   as a backstop for accounts without an explicit reserve.
+2. **Create an admin API key** in the sub2api admin UI (Settings, Admin API
+   key, Regenerate). Optionally set the platform scheduling threshold there as
+   a backstop for accounts without an explicit reserve.
 
-3. **Write the config.** Copy `deploy/config.example.json` to `config.json`
-   and set `group_id`, the account IDs in your preferred base order, and any
-   per-account ceilings. Leave `mode` as `shadow`.
+3. **Write the config.** Copy `deploy/config.example.json` to `config.json`,
+   set `group_id`, list the account IDs in your preferred base order, and add
+   per-account ceilings where you want a reserve. Leave `mode` as `shadow`.
 
-4. **Install on the host.** Put `dist/sub2cc-quota-scheduler`, `config.json`,
-   `deploy/sub2cc-quota-scheduler.service`, `deploy/sub2cc-quota-scheduler.timer`,
-   and `deploy/install.sh` in one directory on the host, then:
+4. **Install on the host.** Put the binary (named `sub2cc-quota-scheduler`),
+   `config.json`, both unit files from `deploy/`, and `deploy/install.sh` in
+   one directory, then:
 
    ```sh
    sudo sh install.sh
@@ -147,9 +167,6 @@ compatible on the target host; nothing else on the host.
    tail -n 1 /var/lib/sub2cc-scheduler/decisions.jsonl | python3 -m json.tool
    ```
 
-   Each line lists every account with its windows, headroom, pressure, and
-   target priority, plus the `actions` it would take and any `warnings`.
-
 6. **Enable writes** by changing `"mode": "shadow"` to `"mode": "apply"` in
    `/etc/sub2cc-scheduler/config.json`. The next run applies the actions; a
    run with nothing to change performs no writes.
@@ -158,7 +175,9 @@ Rollback at any time: `sudo systemctl disable --now sub2cc-quota-scheduler.timer
 Priorities, the schedulable flag, and group routing remain ordinary fields
 you can edit in the sub2api admin UI.
 
-## Configuration reference
+## Configuration
+
+See [`deploy/config.example.json`](deploy/config.example.json).
 
 | Key | Default | Meaning |
 | --- | --- | --- |
@@ -186,40 +205,93 @@ sub2cc-quota-scheduler version
 ```
 
 `plan` never writes, whatever the config says, and accepts `--now` to preview
-a future point in time. `--state-dir` defaults to systemd's
+a future point in time against live data. `--state-dir` defaults to systemd's
 `$STATE_DIRECTORY`.
 
 ## Safety properties
 
 - Reads: `GET /api/v1/admin/accounts?group=<id>` and `GET /api/v1/admin/groups/<id>`.
-- Writes, apply mode only: `PUT /api/v1/admin/accounts/<id>` with `{"priority": n}`,
-  `POST /api/v1/admin/accounts/<id>/schedulable`, and
+- Writes, apply mode only: `PUT /api/v1/admin/accounts/<id>` with
+  `{"priority": n}`, `POST /api/v1/admin/accounts/<id>/schedulable`, and
   `PUT /api/v1/admin/groups/<id>` with `model_routing` and
   `model_routing_enabled`. No request ever carries `extra`, `credentials`,
-  `group_ids`, or `status`, because a full `extra` update in sub2api replaces
-  the map and would wipe the passive usage data.
+  `group_ids`, or `status`; a full `extra` update in sub2api replaces the map
+  and would wipe the passive usage data.
 - Any fetch failure or missing account aborts the run before any write.
 - All writes go through the audited admin API; nothing touches PostgreSQL or
   Redis directly.
+- The admin key is read from the environment and never logged. See
+  [SECURITY.md](SECURITY.md).
+
+## Compatibility
+
+| sub2api | Status |
+| --- | --- |
+| v0.2.0 | Verified in production |
+| Older 0.1.x | Untested; the admin endpoints above existed for a while but check `extra` field names |
+| Newer | Please report; if upstream ships native reset-aware scheduling this project can retire |
+
+Platform: any Linux with systemd (`amd64` and `arm64` binaries are released).
+The scheduler itself is a plain executable and can be run by cron or by hand.
 
 ## Limitations
 
-- One priority per account: ordering uses the account-wide 7-day window.
-  The Fable `7d_oi` window is used only for the reserve, not for ordering.
-- Granularity is the timer interval; a five-minute cadence is plenty for
-  session-level allocation but this is not a per-request scheduler.
-- Passive usage data is only refreshed when an account serves a request.
+- One priority per account: ordering uses the account-wide 7-day window. The
+  Fable `7d_oi` window is used only for the reserve, not for ordering.
+- Granularity is the timer interval. Five minutes is plenty for session-level
+  allocation; this is not a per-request scheduler.
+- Passive usage data is refreshed only when an account serves a request.
   Stale usage is a safe lower bound; the reset timestamp is what matters.
-- Verified against sub2api v0.2.0. Later versions may change the admin API
-  or add native reset-aware scheduling, at which point this sidecar becomes
-  unnecessary.
+- It can only steer traffic that exists. If nobody sends requests, expiring
+  capacity still expires.
 
-## Development
+## Roadmap
+
+- [ ] Per-model ordering using the `7d_oi` window for Fable-class models.
+- [ ] Weighted allocation across several urgent accounts, if sub2api exposes
+      a lever for it (see [#979](https://github.com/Wei-Shaw/sub2api/issues/979)).
+- [ ] Other platforms for which sub2api records 5h/7d windows.
+- [ ] Optional Prometheus-style metrics endpoint for the decision log.
+
+Have a use case? Open an issue with the situation and the decision log line.
+
+## FAQ
+
+**Will it move my running Claude Code session to another account?**
+No. Reordering only changes where new sessions land; sub2api's sticky binding
+keeps existing sessions in place. The only thing that can move a session is
+the optional hard reserve on an account you explicitly marked.
+
+**Why not patch sub2api?**
+Because you would have to re-patch on every release. The sidecar uses public
+admin endpoints and stable `extra` field names, and is a one-line disable if
+anything drifts.
+
+**Does it need database or Redis access?**
+No. Loopback HTTP to the admin API is the only dependency.
+
+**Can I run it from cron instead of systemd?**
+Yes: run `sub2cc-quota-scheduler run --config ... --state-dir <dir>` with the
+key in the environment. The systemd unit just adds sandboxing.
+
+## Contributing
+
+Bug reports with a decision log line, compatibility notes for other sub2api
+versions, and small focused pull requests are all welcome. See
+[CONTRIBUTING.md](CONTRIBUTING.md). Development loop:
 
 ```sh
 gofmt -l . && go vet ./... && go test ./...
 ```
 
-Tests cover window normalization, urgent ranking and hysteresis, the reserve
-and its release, routing ownership checks, the abort conditions, the exact
-request bodies sent to the admin API, and shadow versus apply behavior.
+## Related
+
+- [Wei-Shaw/sub2api](https://github.com/Wei-Shaw/sub2api), the gateway this
+  project schedules for.
+- [sub2api#5583](https://github.com/Wei-Shaw/sub2api/issues/5583), the
+  upstream request for unified 5h/7d reset-aware scheduling.
+
+## License
+
+[MIT](LICENSE). This project does not include or link any sub2api code; it
+talks to sub2api over its HTTP admin API.

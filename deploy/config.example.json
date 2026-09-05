@@ -9,6 +9,8 @@
   "default_ceiling_percent": 95,
   "default_fable_ceiling_percent": 95,
   "fable_model_pattern": "claude-fable-*",
+  "drain_hours": 24,
+  "drain_model_pattern": "claude-*",
   "accounts": [
     { "id": 9, "name": "relay", "kind": "relay" },
     { "id": 11, "name": "sub-a", "kind": "subscription" },

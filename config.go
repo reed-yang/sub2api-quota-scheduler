@@ -15,21 +15,29 @@ type AccountPolicy struct {
 	CeilingPercent      *float64 `json:"ceiling_percent,omitempty"`
 	FableCeilingPercent *float64 `json:"fable_ceiling_percent,omitempty"`
 	EnforceCeiling      bool     `json:"enforce_ceiling,omitempty"`
+	// DrainExempt keeps the account out of drain routing. Accounts with
+	// EnforceCeiling are exempt implicitly.
+	DrainExempt bool `json:"drain_exempt,omitempty"`
 }
 
 // Config is the on-disk scheduler configuration.
 type Config struct {
-	BaseURL                    string          `json:"base_url"`
-	AdminKeyEnv                string          `json:"admin_key_env"`
-	Mode                       string          `json:"mode"`
-	GroupID                    int64           `json:"group_id"`
-	LookaheadHours             float64         `json:"lookahead_hours"`
-	MinUrgentHeadroomPercent   float64         `json:"min_urgent_headroom_percent"`
-	HysteresisRatio            float64         `json:"hysteresis_ratio"`
-	DefaultCeilingPercent      float64         `json:"default_ceiling_percent"`
-	DefaultFableCeilingPercent float64         `json:"default_fable_ceiling_percent"`
-	FableModelPattern          string          `json:"fable_model_pattern"`
-	Accounts                   []AccountPolicy `json:"accounts"`
+	BaseURL                    string  `json:"base_url"`
+	AdminKeyEnv                string  `json:"admin_key_env"`
+	Mode                       string  `json:"mode"`
+	GroupID                    int64   `json:"group_id"`
+	LookaheadHours             float64 `json:"lookahead_hours"`
+	MinUrgentHeadroomPercent   float64 `json:"min_urgent_headroom_percent"`
+	HysteresisRatio            float64 `json:"hysteresis_ratio"`
+	DefaultCeilingPercent      float64 `json:"default_ceiling_percent"`
+	DefaultFableCeilingPercent float64 `json:"default_fable_ceiling_percent"`
+	FableModelPattern          string  `json:"fable_model_pattern"`
+	// DrainHours enables "drain mode": when a non-exempt subscription resets
+	// within this many hours, group routing sends DrainModelPattern to that
+	// account alone so existing sessions move onto it too. 0 disables.
+	DrainHours        float64         `json:"drain_hours"`
+	DrainModelPattern string          `json:"drain_model_pattern"`
+	Accounts          []AccountPolicy `json:"accounts"`
 }
 
 // LoadConfig reads, defaults, and validates a config file.
@@ -77,6 +85,9 @@ func (c *Config) applyDefaults() {
 	if c.FableModelPattern == "" {
 		c.FableModelPattern = "claude-fable-*"
 	}
+	if c.DrainModelPattern == "" {
+		c.DrainModelPattern = "claude-*"
+	}
 }
 
 func (c *Config) validate() error {
@@ -88,6 +99,12 @@ func (c *Config) validate() error {
 	}
 	if len(c.Accounts) == 0 {
 		return errors.New("accounts must not be empty")
+	}
+	if c.DrainHours < 0 {
+		return errors.New("drain_hours must not be negative")
+	}
+	if c.DrainHours > 0 && c.DrainModelPattern == c.FableModelPattern {
+		return errors.New("drain_model_pattern must differ from fable_model_pattern")
 	}
 	seen := map[int64]bool{}
 	for _, a := range c.Accounts {

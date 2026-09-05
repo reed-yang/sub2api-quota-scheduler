@@ -293,3 +293,115 @@ func TestEvaluateFillsPerAccountTargetsForEveryAccount(t *testing.T) {
 		}
 	}
 }
+
+func drainConfig() *Config {
+	cfg := testConfig()
+	cfg.DrainHours = 24
+	return cfg
+}
+
+func routingAction(d Decision) *Action {
+	for i := range d.Actions {
+		if d.Actions[i].Type == "set_routing" {
+			return &d.Actions[i]
+		}
+	}
+	return nil
+}
+
+func TestDrainDisabledByDefaultProducesNoRouting(t *testing.T) {
+	cfg := testConfig()
+	d, err := Evaluate(cfg, snaps(cfg, liveWindows(), livePriorities()), GroupRouting{}, State{}, testNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if routingAction(d) != nil || d.DrainAccount != 0 {
+		t.Fatalf("drain must be off by default: %+v", d.Actions)
+	}
+}
+
+func TestDrainRoutesEverythingToSoonestNonExemptAccount(t *testing.T) {
+	cfg := drainConfig()
+	wins := liveWindows()
+	wins[8] = [2]Window{known(25, testNow.Add(21*time.Hour)), known(41, testNow.Add(21*time.Hour))}
+	wins[1] = [2]Window{known(20, testNow.Add(10*time.Hour)), known(20, testNow.Add(10*time.Hour))} // my-sub sooner but exempt
+	d, err := Evaluate(cfg, snaps(cfg, wins, livePriorities()), GroupRouting{}, State{}, testNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := routingAction(d)
+	if r == nil || !r.Enabled || len(r.Routing) != 1 || len(r.Routing["claude-*"]) != 1 || r.Routing["claude-*"][0] != 8 {
+		t.Fatalf("expected claude-* -> [8], got %+v", d.Actions)
+	}
+	if d.DrainAccount != 8 || d.State.DrainAccountID != 8 || !d.State.RoutingOwned || d.State.DrainUntil != wins[8][0].Reset.Unix() {
+		t.Fatalf("state=%+v drain=%d", d.State, d.DrainAccount)
+	}
+}
+
+func TestDrainIgnoresAccountsOutsideWindowUnschedulableOrExhausted(t *testing.T) {
+	cfg := drainConfig()
+	wins := liveWindows()
+	wins[8] = [2]Window{known(25, testNow.Add(30*time.Hour)), known(25, testNow.Add(30*time.Hour))} // outside 24h
+	d, _ := Evaluate(cfg, snaps(cfg, wins, livePriorities()), GroupRouting{}, State{}, testNow)
+	if routingAction(d) != nil {
+		t.Fatalf("no account within 24h: %+v", d.Actions)
+	}
+	wins[8] = [2]Window{known(96, testNow.Add(3*time.Hour)), known(25, testNow.Add(3*time.Hour))} // exhausted
+	d, _ = Evaluate(cfg, snaps(cfg, wins, livePriorities()), GroupRouting{}, State{}, testNow)
+	if routingAction(d) != nil {
+		t.Fatalf("exhausted account must not be drained: %+v", d.Actions)
+	}
+	wins[8] = [2]Window{known(25, testNow.Add(3*time.Hour)), known(25, testNow.Add(3*time.Hour))}
+	ss := snaps(cfg, wins, livePriorities())
+	ss[3].Schedulable = false
+	d, _ = Evaluate(cfg, ss, GroupRouting{}, State{}, testNow)
+	if routingAction(d) != nil {
+		t.Fatalf("unschedulable account must not be drained: %+v", d.Actions)
+	}
+	cfg.Accounts[3].DrainExempt = true
+	d, _ = Evaluate(cfg, snaps(cfg, wins, livePriorities()), GroupRouting{}, State{}, testNow)
+	if routingAction(d) != nil {
+		t.Fatalf("drain_exempt account must not be drained: %+v", d.Actions)
+	}
+}
+
+func TestDrainReleasedAfterRolloverAndOnlyWhenOwned(t *testing.T) {
+	cfg := drainConfig()
+	live := GroupRouting{Routing: map[string][]int64{"claude-*": {8}}, Enabled: true}
+	wins := liveWindows()
+	wins[8] = [2]Window{{State: WindowRolled, Reset: testNow.Add(166 * time.Hour)}, {State: WindowRolled, Reset: testNow.Add(166 * time.Hour)}}
+	owned := State{RoutingOwned: true, DrainAccountID: 8, DrainUntil: testNow.Add(-time.Hour).Unix()}
+	d, _ := Evaluate(cfg, snaps(cfg, wins, livePriorities()), live, owned, testNow)
+	r := routingAction(d)
+	if r == nil || r.Enabled || len(r.Routing) != 0 || d.State.RoutingOwned || d.State.DrainAccountID != 0 {
+		t.Fatalf("expected routing cleared, got %+v state=%+v", d.Actions, d.State)
+	}
+	// Same live routing but not owned by us: warn, do not touch.
+	d, _ = Evaluate(cfg, snaps(cfg, wins, livePriorities()), live, State{}, testNow)
+	if routingAction(d) != nil || len(d.Warnings) == 0 {
+		t.Fatalf("foreign routing must be left alone: %+v %v", d.Actions, d.Warnings)
+	}
+}
+
+func TestDrainCombinesWithFableReserve(t *testing.T) {
+	cfg := drainConfig()
+	wins := liveWindows()
+	wins[8] = [2]Window{known(25, testNow.Add(21*time.Hour)), known(41, testNow.Add(21*time.Hour))}
+	wins[1] = [2]Window{known(32, testNow.Add(80*time.Hour)), known(81, testNow.Add(80*time.Hour))}
+	d, _ := Evaluate(cfg, snaps(cfg, wins, livePriorities()), GroupRouting{}, State{}, testNow)
+	r := routingAction(d)
+	if r == nil || len(r.Routing) != 2 || r.Routing["claude-*"][0] != 8 || len(r.Routing["claude-fable-*"]) != 4 {
+		t.Fatalf("expected drain + fable routing, got %+v", d.Actions)
+	}
+	for _, id := range r.Routing["claude-fable-*"] {
+		if id == 1 {
+			t.Fatal("reserved account must stay out of Fable routing during drain")
+		}
+	}
+	// Second run with identical live routing and owned state: no action.
+	live := GroupRouting{Routing: r.Routing, Enabled: true}
+	d2, _ := Evaluate(cfg, snaps(cfg, wins, livePriorities()), live, d.State, testNow)
+	if routingAction(d2) != nil {
+		t.Fatalf("idempotency violated: %+v", d2.Actions)
+	}
+}

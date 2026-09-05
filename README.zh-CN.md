@@ -8,7 +8,7 @@
 - 单个静态 Go 二进制，仅标准库，约 6 MB，运行时约 3 MB 内存、30 ms。
 - 由 systemd timer 在 sub2api 旁边定时运行，宿主机无需安装任何东西。
 - 默认 shadow 模式：先只记录"本来会改什么"，确认无误后再切 apply。
-- 排序永远不会打断已有的粘性会话；只有你显式配置的硬保留才会。
+- 排序永远不会打断已有的粘性会话；只有你显式开启的硬保留和临期抢流才会。
 - 停掉 timer 就回到 sub2api 的原始行为。
 
 ## 现状
@@ -45,9 +45,10 @@ sub2api v0.2.0 自己回答不了这个问题：
 3. **紧急池排序**：距重置不超过 `lookahead_hours`、且剩余额度不少于 `min_urgent_headroom_percent` 的订阅进入紧急池，按 `压力 = 剩余额度 / 距重置小时数` 排序；两个紧急账号只有在压力差超过 `hysteresis_ratio` 时才互换位置，避免抖动。
 4. **写入优先级**：紧急池在前，其余按配置的基础顺序，写成 1..N。只写线上值不同的账号，请求体只有 `priority`。
 5. **执行保留**（标记了 `enforce_ceiling` 的账号）：7 天用量达到 `ceiling_percent` 就设为不可调度直到窗口重置再恢复，且只恢复自己关掉的账号；Fable（`7d_oi`）用量达到 `fable_ceiling_percent` 就写一条分组路由把 `fable_model_pattern` 导向其它账号，重置后撤销。不是自己写的路由一律不动，只告警。
-6. **记录**一行 JSON 决策到 stdout 和 `decisions.jsonl`，并保存一个很小的状态文件。
+6. **临期抢流**（可选，`drain_hours`）：某个未被排除的订阅在这么多小时内就要重置时，写一条分组路由（`drain_model_pattern`，默认 `claude-*`）只指向该账号。sub2api 在粘性之前先看路由，所以**已有会话**也会转到它上面；它被限流时 sub2api 回落到正常的优先级选择，恢复后路由再把流量拉回来。每次切换丢一次提示缓存，抢流期间 relay 被绕过。标记了 `enforce_ceiling` 或 `drain_exempt` 的账号永远不会成为抢流目标。
+7. **记录**一行 JSON 决策到 stdout 和 `decisions.jsonl`，并保存一个很小的状态文件。
 
-除保留之外都是"软"的：只影响**新**会话落在哪里。已有会话由 sub2api 的粘性机制留在原账号，sub2api 自己的限流和阈值逻辑照常生效。
+除保留和抢流之外都是"软"的：只影响**新**会话落在哪里。已有会话由 sub2api 的粘性机制留在原账号，sub2api 自己的限流和阈值逻辑照常生效。
 
 ## 快速开始
 
@@ -70,7 +71,7 @@ sub2api v0.2.0 自己回答不了这个问题：
 
 ## 配置项
 
-见 [`deploy/config.example.json`](deploy/config.example.json)。各键含义与英文 README 的配置表一致：`base_url`、`admin_key_env`、`mode`、`group_id`、`lookahead_hours`、`min_urgent_headroom_percent`、`hysteresis_ratio`、`default_ceiling_percent`、`default_fable_ceiling_percent`、`fable_model_pattern`、`accounts[]`。`kind` 为 `relay` 的账号（看不到内部额度的 API key 中转）永远只按基础顺序排。
+见 [`deploy/config.example.json`](deploy/config.example.json)。各键含义与英文 README 的配置表一致：`base_url`、`admin_key_env`、`mode`、`group_id`、`lookahead_hours`、`min_urgent_headroom_percent`、`hysteresis_ratio`、`default_ceiling_percent`、`default_fable_ceiling_percent`、`fable_model_pattern`、`drain_hours`（默认 0 关闭）、`drain_model_pattern`、`accounts[]`（账号可加 `drain_exempt`）。`kind` 为 `relay` 的账号（看不到内部额度的 API key 中转）永远只按基础顺序排。
 
 ## 安全边界
 

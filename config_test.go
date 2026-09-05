@@ -47,3 +47,16 @@ func TestLoadConfigRejectsBadInput(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadConfigDrainValidation(t *testing.T) {
+	cfg, err := LoadConfig(writeTemp(t, `{"group_id":12,"drain_hours":24,"accounts":[{"id":1,"name":"a","kind":"subscription"}]}`))
+	if err != nil || cfg.DrainHours != 24 || cfg.DrainModelPattern != "claude-*" {
+		t.Fatalf("cfg=%+v err=%v", cfg, err)
+	}
+	if _, err := LoadConfig(writeTemp(t, `{"group_id":12,"drain_hours":-1,"accounts":[{"id":1,"name":"a","kind":"subscription"}]}`)); err == nil {
+		t.Fatal("negative drain_hours must fail")
+	}
+	if _, err := LoadConfig(writeTemp(t, `{"group_id":12,"drain_hours":24,"drain_model_pattern":"claude-fable-*","accounts":[{"id":1,"name":"a","kind":"subscription"}]}`)); err == nil {
+		t.Fatal("drain pattern equal to fable pattern must fail")
+	}
+}

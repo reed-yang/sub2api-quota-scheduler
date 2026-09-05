@@ -4,6 +4,26 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.2.0] - 2026-09-05
+
+### Added
+
+- Optional **drain mode** (`drain_hours`, default off): when a non-exempt
+  subscription's 7-day window resets within that many hours, the scheduler
+  installs a group routing rule (`drain_model_pattern`, default `claude-*`)
+  pointing at that account alone. sub2api evaluates routing before sticky
+  sessions, so existing sessions move onto the draining account as well; when
+  it is rate-limited sub2api falls back to normal priority selection and the
+  routing pulls traffic back once it recovers. Accounts with `enforce_ceiling`
+  or `drain_exempt` are never drained. The rule is removed at the reset.
+- `drain_account_id` in the decision log; `routing_owned`, `drain_account_id`,
+  `drain_until` in the state file.
+
+### Changed
+
+- Reserve and drain routing are reconciled as one routing map owned by the
+  scheduler. Routing the scheduler did not write is still left untouched.
+
 ## [0.1.1] - 2026-09-04
 
 ### Changed

@@ -101,11 +101,20 @@ Every run (default: every five minutes):
      group routing rule that sends `fable_model_pattern` to the other
      configured accounts, and remove it after the reset. Routing the
      scheduler did not write is left alone with a warning.
-6. **Log** one JSON decision line to stdout and `decisions.jsonl`, and persist
+6. **Drain mode** (optional, `drain_hours`): when a non-exempt subscription
+   resets within that many hours, install a group routing rule
+   (`drain_model_pattern`, default `claude-*`) that points at that account
+   alone. sub2api checks routing before sticky sessions, so *existing*
+   sessions move onto the draining account too; if it gets rate-limited,
+   sub2api falls back to normal priority selection, and the routing pulls
+   traffic back as soon as it recovers. Each switch costs one prompt-cache
+   miss, and relays are bypassed while draining. Accounts with
+   `enforce_ceiling` or `drain_exempt` are never drained.
+7. **Log** one JSON decision line to stdout and `decisions.jsonl`, and persist
    a small state file.
 
-Everything except the reserve is soft: it only changes where **new** sessions
-land. sub2api's sticky-session logic keeps existing sessions on their account,
+Everything except the reserve and drain mode is soft: it only changes where
+**new** sessions land. sub2api's sticky-session logic keeps existing sessions on their account,
 and its own rate-limit and threshold handling still applies on top.
 
 ### Worked example
@@ -192,7 +201,9 @@ See [`deploy/config.example.json`](deploy/config.example.json).
 | `default_ceiling_percent` | `95` | 7d ceiling used for headroom when an account sets none |
 | `default_fable_ceiling_percent` | `95` | `7d_oi` ceiling used when an account sets none |
 | `fable_model_pattern` | `claude-fable-*` | routing pattern installed for the Fable reserve |
-| `accounts[]` | required | ordered list; each has `id`, `name`, `kind` (`relay` or `subscription`), optional `ceiling_percent`, `fable_ceiling_percent`, `enforce_ceiling` |
+| `drain_hours` | `0` (off) | drain mode: route everything to a subscription that resets within this many hours |
+| `drain_model_pattern` | `claude-*` | routing pattern installed while draining |
+| `accounts[]` | required | ordered list; each has `id`, `name`, `kind` (`relay` or `subscription`), optional `ceiling_percent`, `fable_ceiling_percent`, `enforce_ceiling`, `drain_exempt` |
 
 `relay` accounts (API-key relays with no visible quota) always stay in the
 base order. Only the listed accounts are ever read for policy or written.
@@ -248,6 +259,7 @@ The scheduler itself is a plain executable and can be run by cron or by hand.
 
 ## Roadmap
 
+- [x] Drain mode: move existing sessions onto an expiring account (0.2.0).
 - [ ] Per-model ordering using the `7d_oi` window for Fable-class models.
 - [ ] Weighted allocation across several urgent accounts, if sub2api exposes
       a lever for it (see [#979](https://github.com/Wei-Shaw/sub2api/issues/979)).
@@ -259,9 +271,18 @@ Have a use case? Open an issue with the situation and the decision log line.
 ## FAQ
 
 **Will it move my running Claude Code session to another account?**
-No. Reordering only changes where new sessions land; sub2api's sticky binding
-keeps existing sessions in place. The only thing that can move a session is
-the optional hard reserve on an account you explicitly marked.
+Not by reordering: sub2api's sticky binding keeps existing sessions in place.
+Two optional features can move sessions, and both are off unless you enable
+them: the hard reserve on an account you marked `enforce_ceiling`, and drain
+mode, which deliberately pulls every session onto an account whose weekly
+window is about to reset.
+
+**Why does an urgent account still not get all the traffic?**
+Three things the scheduler cannot change: sub2api rewrites a session's sticky
+binding when a request fails over (one transient upstream error is enough),
+an account that hits its 5-hour limit is excluded until that window ends, and
+a 7-day window simply cannot be drained in a few hours. Drain mode addresses
+the first two by routing rather than ordering.
 
 **Why not patch sub2api?**
 Because you would have to re-patch on every release. The sidecar uses public

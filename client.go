@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -44,11 +46,14 @@ type AdminClient struct {
 	BaseURL string
 	APIKey  string
 	HTTP    *http.Client
+	// ProbeHTTP is used for the account test endpoint, which streams a real
+	// upstream completion and therefore needs a longer timeout.
+	ProbeHTTP *http.Client
 }
 
 // NewAdminClient builds a client with a short timeout suitable for loopback.
 func NewAdminClient(baseURL, apiKey string) *AdminClient {
-	return &AdminClient{BaseURL: baseURL, APIKey: apiKey, HTTP: &http.Client{Timeout: 20 * time.Second}}
+	return &AdminClient{BaseURL: baseURL, APIKey: apiKey, HTTP: &http.Client{Timeout: 20 * time.Second}, ProbeHTTP: &http.Client{Timeout: 120 * time.Second}}
 }
 
 func (c *AdminClient) do(ctx context.Context, method, path string, body any, out any) error {
@@ -126,6 +131,102 @@ func (c *AdminClient) SetRouting(ctx context.Context, groupID int64, routing map
 		routing = map[string][]int64{}
 	}
 	return c.do(ctx, http.MethodPut, fmt.Sprintf("/api/v1/admin/groups/%d", groupID), map[string]any{"model_routing": routing, "model_routing_enabled": enabled}, nil)
+}
+
+// ProbeAccount asks sub2api to send one test message through the account so
+// Anthropic starts a new window. The endpoint streams SSE events and reports
+// failures as an "error" event with HTTP 200, so the stream is parsed instead
+// of trusting the status code.
+func (c *AdminClient) ProbeAccount(ctx context.Context, id int64, model string) error {
+	body := map[string]any{}
+	if model != "" {
+		body["model_id"] = model
+	}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("%s/api/v1/admin/accounts/%d/test", c.BaseURL, id), bytes.NewReader(raw))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("x-api-key", c.APIKey)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+	client := c.ProbeHTTP
+	if client == nil {
+		client = c.HTTP
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("probe account %d: %w", id, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("probe account %d: status %d: %s", id, resp.StatusCode, strings.TrimSpace(string(snippet)))
+	}
+	// sub2api emits test_complete on plain EOF as well, even when the upstream
+	// body carried no SSE at all, so a completion only counts after content.
+	sawContent := false
+	reader := bufio.NewReader(resp.Body)
+	for {
+		line, truncated, readErr := readLine(reader, 4<<20)
+		if line = strings.TrimSpace(line); strings.HasPrefix(line, "data:") {
+			var ev struct {
+				Type    string `json:"type"`
+				Error   string `json:"error"`
+				Success bool   `json:"success"`
+			}
+			payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			if truncated {
+				return fmt.Errorf("probe account %d: oversized event: %.200s", id, payload)
+			}
+			if json.Unmarshal([]byte(payload), &ev) == nil {
+				switch ev.Type {
+				case "content":
+					sawContent = true
+				case "error":
+					if ev.Error == "" {
+						ev.Error = "unknown error"
+					}
+					return fmt.Errorf("probe account %d: %s", id, ev.Error)
+				case "test_complete":
+					if ev.Success && sawContent {
+						return nil
+					}
+					if ev.Success {
+						return fmt.Errorf("probe account %d: test_complete without any content; upstream body was not a completion", id)
+					}
+					return fmt.Errorf("probe account %d: test_complete without success", id)
+				}
+			}
+		}
+		if readErr == io.EOF {
+			return fmt.Errorf("probe account %d: stream ended without completion", id)
+		}
+		if readErr != nil {
+			return fmt.Errorf("probe account %d: read stream: %w", id, readErr)
+		}
+	}
+}
+
+// readLine returns the next line, keeping at most limit bytes of it and
+// discarding the rest, so an oversized upstream error cannot abort the read.
+// truncated reports whether anything was dropped.
+func readLine(r *bufio.Reader, limit int) (line string, truncated bool, err error) {
+	var buf []byte
+	for {
+		chunk, readErr := r.ReadSlice('\n')
+		room := limit - len(buf)
+		if len(chunk) > room {
+			chunk, truncated = chunk[:room], true
+		}
+		buf = append(buf, chunk...)
+		if readErr != bufio.ErrBufferFull {
+			return string(buf), truncated, readErr
+		}
+	}
 }
 
 // SnapshotsFromAPI maps live accounts onto the policy accounts, ignoring others.

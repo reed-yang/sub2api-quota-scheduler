@@ -25,6 +25,21 @@ type GroupRouting struct {
 	Enabled bool
 }
 
+// ProbeRecord remembers the last probe attempt on an account. At drives the
+// cooldown; OK marks a delivered probe whose window may be estimated. The
+// baseline fields capture the passive window seen at probe time so that any
+// newer sample invalidates the estimate.
+type ProbeRecord struct {
+	At                int64 `json:"at"`
+	OK                bool  `json:"ok"`
+	BaselineReset     int64 `json:"baseline_reset,omitempty"`
+	BaselineSampledAt int64 `json:"baseline_sampled_at,omitempty"`
+}
+
+// maxProbesPerRun bounds how many probes one run may send, so a cluster of
+// idle accounts cannot stretch a run past the systemd timer interval.
+const maxProbesPerRun = 3
+
 // State is persisted between runs.
 type State struct {
 	LastOrder     []int64         `json:"last_order"`
@@ -32,16 +47,20 @@ type State struct {
 	FableUntil    int64           `json:"fable_until"`
 	// RoutingOwned records that the group's model routing was written by the
 	// scheduler, so it may be rewritten or cleared.
-	RoutingOwned   bool   `json:"routing_owned"`
-	DrainAccountID int64  `json:"drain_account_id"`
-	DrainUntil     int64  `json:"drain_until"`
-	LastRun        string `json:"last_run"`
+	RoutingOwned   bool                  `json:"routing_owned"`
+	DrainAccountID int64                 `json:"drain_account_id"`
+	DrainUntil     int64                 `json:"drain_until"`
+	Probes         map[int64]ProbeRecord `json:"probes"`
+	LastRun        string                `json:"last_run"`
 }
 
 func (s State) clone() State {
-	out := State{LastOrder: append([]int64(nil), s.LastOrder...), DisabledUntil: map[int64]int64{}, FableUntil: s.FableUntil, RoutingOwned: s.RoutingOwned, DrainAccountID: s.DrainAccountID, DrainUntil: s.DrainUntil, LastRun: s.LastRun}
+	out := State{LastOrder: append([]int64(nil), s.LastOrder...), DisabledUntil: map[int64]int64{}, FableUntil: s.FableUntil, RoutingOwned: s.RoutingOwned, DrainAccountID: s.DrainAccountID, DrainUntil: s.DrainUntil, Probes: map[int64]ProbeRecord{}, LastRun: s.LastRun}
 	for k, v := range s.DisabledUntil {
 		out.DisabledUntil[k] = v
+	}
+	for k, v := range s.Probes {
+		out.Probes[k] = v
 	}
 	return out
 }
@@ -55,25 +74,29 @@ type Action struct {
 	Value     bool               `json:"value"`
 	Routing   map[string][]int64 `json:"routing,omitempty"`
 	Enabled   bool               `json:"enabled"`
-	Reason    string             `json:"reason"`
+	// Model is the probe model; Result is filled in by apply mode.
+	Model  string `json:"model,omitempty"`
+	Result string `json:"result,omitempty"`
+	Reason string `json:"reason"`
 }
 
 // AccountDecision is the per-account explanation in the decision log.
+// HoursToReset is null for windows without a deadline (idle, unknown).
 type AccountDecision struct {
-	ID              int64   `json:"id"`
-	Name            string  `json:"name"`
-	Kind            string  `json:"kind"`
-	Schedulable     bool    `json:"schedulable"`
-	Win7d           Window  `json:"win_7d"`
-	WinFable        Window  `json:"win_fable"`
-	Ceiling         float64 `json:"ceiling_percent"`
-	FableCeiling    float64 `json:"fable_ceiling_percent"`
-	Headroom        float64 `json:"headroom_percent"`
-	HoursToReset    float64 `json:"hours_to_reset"`
-	Pressure        float64 `json:"pressure"`
-	Urgent          bool    `json:"urgent"`
-	CurrentPriority int     `json:"current_priority"`
-	TargetPriority  int     `json:"target_priority"`
+	ID              int64    `json:"id"`
+	Name            string   `json:"name"`
+	Kind            string   `json:"kind"`
+	Schedulable     bool     `json:"schedulable"`
+	Win7d           Window   `json:"win_7d"`
+	WinFable        Window   `json:"win_fable"`
+	Ceiling         float64  `json:"ceiling_percent"`
+	FableCeiling    float64  `json:"fable_ceiling_percent"`
+	Headroom        float64  `json:"headroom_percent"`
+	HoursToReset    *float64 `json:"hours_to_reset"`
+	Pressure        float64  `json:"pressure"`
+	Urgent          bool     `json:"urgent"`
+	CurrentPriority int      `json:"current_priority"`
+	TargetPriority  int      `json:"target_priority"`
 }
 
 // Decision is the full output of one evaluation.
@@ -111,6 +134,7 @@ func Evaluate(cfg *Config, snaps []AccountSnapshot, group GroupRouting, prev Sta
 	}
 
 	d := Decision{Time: now.UTC(), Mode: cfg.Mode, GroupID: cfg.GroupID, State: prev.clone(), Warnings: []string{}, Actions: []Action{}}
+	applyProbeEstimates(cfg, byID, &d, now)
 	// Pre-size Accounts so the per-account pointers below stay valid across appends.
 	d.Accounts = make([]AccountDecision, 0, len(cfg.Accounts))
 	var urgent, normal []candidate
@@ -122,10 +146,12 @@ func Evaluate(cfg *Config, snaps []AccountSnapshot, group GroupRouting, prev Sta
 		d.Accounts = append(d.Accounts, ad)
 		c := candidate{snap: s, decision: &d.Accounts[len(d.Accounts)-1]}
 		if a.Kind == "subscription" && s.Win7d.State != WindowUnknown {
+			c.decision.Headroom = ceiling - s.Win7d.UsedPercent
+		}
+		if a.Kind == "subscription" && s.Win7d.HasDeadline() {
 			hours := s.Win7d.HoursToReset(now)
-			headroom := ceiling - s.Win7d.UsedPercent
-			c.decision.HoursToReset = hours
-			c.decision.Headroom = headroom
+			headroom := c.decision.Headroom
+			c.decision.HoursToReset = &hours
 			if hours <= cfg.LookaheadHours && headroom >= cfg.MinUrgentHeadroomPercent {
 				c.decision.Pressure = headroom / math.Max(hours, 1)
 				c.decision.Urgent = true
@@ -145,7 +171,7 @@ func Evaluate(cfg *Config, snaps []AccountSnapshot, group GroupRouting, prev Sta
 		if c.snap.Priority != target {
 			reason := "base order"
 			if c.decision.Urgent {
-				reason = fmt.Sprintf("urgent: headroom %.1f%% over %.1fh", c.decision.Headroom, c.decision.HoursToReset)
+				reason = fmt.Sprintf("urgent: headroom %.1f%% over %.1fh", c.decision.Headroom, *c.decision.HoursToReset)
 			}
 			d.Actions = append(d.Actions, Action{Type: "set_priority", AccountID: c.snap.Policy.ID, From: c.snap.Priority, To: target, Reason: reason})
 		}
@@ -173,7 +199,89 @@ func Evaluate(cfg *Config, snaps []AccountSnapshot, group GroupRouting, prev Sta
 		d.State.DrainAccountID, d.State.DrainUntil = 0, 0
 	}
 	reconcileRouting(cfg, &d, group, desired)
+	planProbes(cfg, &d, byID, now)
 	return d, nil
+}
+
+// applyProbeEstimates overlays the window a delivered probe is expected to
+// have started, for as long as sub2api still shows the same ended window (or
+// none at all) that was seen at probe time. Any newer sample, whether a live
+// window or a later ended one, retires the probe record so sampled data always
+// wins; an expired estimate leaves the account idle again. Nothing is
+// overlaid when the feature is off or the account is exempt, so turning the
+// feature off is a complete rollback.
+func applyProbeEstimates(cfg *Config, byID map[int64]AccountSnapshot, d *Decision, now time.Time) {
+	if !cfg.RestartIdleWindows {
+		return
+	}
+	for _, a := range cfg.Accounts {
+		rec, ok := d.State.Probes[a.ID]
+		if a.Kind != "subscription" || a.ProbeExempt || !ok || !rec.OK {
+			continue
+		}
+		s := byID[a.ID]
+		w := s.Win7d
+		probedAt := time.Unix(rec.At, 0).UTC()
+		newer := w.State == WindowKnown || w.SampledAt.After(probedAt) || (w.State == WindowIdle && w.Reset.Unix() != rec.BaselineReset)
+		if newer {
+			delete(d.State.Probes, a.ID)
+			continue
+		}
+		if w.State != WindowIdle && w.State != WindowUnknown {
+			continue
+		}
+		if est, ok := EstimatedWindow(probedAt, now); ok {
+			s.Win7d = est
+			byID[a.ID] = s
+		}
+	}
+}
+
+// planProbes appends a probe action for each subscription without a window
+// deadline (idle, or never sampled) whose window should be started, at most
+// maxProbesPerRun per run. Probes come after every other action and never
+// affect the current run's ordering.
+func planProbes(cfg *Config, d *Decision, byID map[int64]AccountSnapshot, now time.Time) {
+	if !cfg.RestartIdleWindows {
+		return
+	}
+	cooldown := time.Duration(cfg.ProbeCooldownHours * float64(time.Hour))
+	planned := 0
+	for _, a := range cfg.Accounts {
+		if planned >= maxProbesPerRun {
+			d.Warnings = append(d.Warnings, fmt.Sprintf("probe cap of %d per run reached; remaining idle accounts wait for the next run", maxProbesPerRun))
+			return
+		}
+		if a.Kind != "subscription" || a.ProbeExempt {
+			continue
+		}
+		s := byID[a.ID]
+		if s.Win7d.HasDeadline() || s.Status != "active" {
+			continue
+		}
+		if !s.Schedulable && !releasesReserve(d, a.ID) {
+			continue
+		}
+		if rec, ok := d.State.Probes[a.ID]; ok && now.Sub(time.Unix(rec.At, 0)) < cooldown {
+			continue
+		}
+		reason := "no 7d sample on record; sending one message so Anthropic starts the window"
+		if s.Win7d.State == WindowIdle {
+			reason = fmt.Sprintf("7d window ended %s with no request since; sending one message so Anthropic starts the next window", s.Win7d.Reset.Format(time.RFC3339))
+		}
+		d.Actions = append(d.Actions, Action{Type: "probe", AccountID: a.ID, Model: cfg.ProbeModel, Reason: reason})
+		planned++
+	}
+}
+
+// releasesReserve reports whether this decision re-enables the account.
+func releasesReserve(d *Decision, id int64) bool {
+	for _, a := range d.Actions {
+		if a.Type == "set_schedulable" && a.AccountID == id && a.Value {
+			return true
+		}
+	}
+	return false
 }
 
 // selectDrainTarget returns the non-exempt subscription whose 7-day window
@@ -188,7 +296,7 @@ func selectDrainTarget(cfg *Config, d *Decision, byID map[int64]AccountSnapshot,
 			continue
 		}
 		s := byID[a.ID]
-		if !s.Schedulable || s.Win7d.State != WindowKnown {
+		if !s.Schedulable || !s.Win7d.HasDeadline() {
 			continue
 		}
 		ceiling, _ := cfg.Ceiling(a)
@@ -272,7 +380,7 @@ func evaluateReserve(cfg *Config, d *Decision, s AccountSnapshot, ceiling float6
 	if !disabledByUs {
 		return
 	}
-	if now.Unix() >= until || w.State == WindowRolled {
+	if now.Unix() >= until || w.State == WindowIdle || w.State == WindowEstimated {
 		if !s.Schedulable {
 			d.Actions = append(d.Actions, Action{Type: "set_schedulable", AccountID: id, Value: true, Reason: "7d window reset; releasing scheduler-imposed reserve"})
 		}
@@ -295,7 +403,7 @@ func fableReserveRouting(cfg *Config, d *Decision, s AccountSnapshot, fableCeili
 		d.State.FableUntil = w.Reset.Unix()
 		return others
 	}
-	if d.State.FableUntil != 0 && (now.Unix() >= d.State.FableUntil || w.State == WindowRolled) {
+	if d.State.FableUntil != 0 && (now.Unix() >= d.State.FableUntil || w.State == WindowIdle || w.State == WindowEstimated) {
 		d.State.FableUntil = 0
 	}
 	if d.State.FableUntil != 0 {

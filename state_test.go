@@ -41,3 +41,22 @@ func TestAppendDecisionWritesOneJSONLine(t *testing.T) {
 		t.Fatalf("log=%q", raw)
 	}
 }
+
+func TestLoadStateFrom020FileInitialisesProbes(t *testing.T) {
+	dir := t.TempDir()
+	old := `{"last_order":[9,11,4,8,1],"disabled_until":{},"fable_until":0,"routing_owned":false,"drain_account_id":0,"drain_until":0,"last_run":"2026-09-06T05:47:08Z"}`
+	if err := os.WriteFile(filepath.Join(dir, stateFile), []byte(old), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := LoadState(dir)
+	if err != nil || s.Probes == nil || len(s.LastOrder) != 5 {
+		t.Fatalf("state=%+v err=%v", s, err)
+	}
+	s.Probes[8] = ProbeRecord{At: 1, OK: true, BaselineReset: 2}
+	if err := SaveState(dir, s); err != nil {
+		t.Fatal(err)
+	}
+	if again, _ := LoadState(dir); again.Probes[8].BaselineReset != 2 {
+		t.Fatalf("probe record not round-tripped: %+v", again)
+	}
+}

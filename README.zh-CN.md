@@ -41,12 +41,13 @@ sub2api v0.2.0 自己回答不了这个问题：
 每轮（默认每 5 分钟）：
 
 1. **读取**分组账号和分组模型路由。任一配置账号缺失或不在分组内，本轮直接放弃、不写任何东西。
-2. **归一化**每个订阅账号的 7 天窗口（来自 sub2api 存在 `extra` 里的被动采样字段）：`known` 有用量和未来的重置时间；`rolled` 重置时间已过但还没新采样，按用量 0、重置时间整周外推处理；`unknown` 字段缺失（sub2api 在每个新的 5 小时窗口会清空它们直到下次采样），回落基础顺序且不会触发保留动作。
+2. **归一化**每个订阅账号的 7 天窗口（来自 sub2api 存在 `extra` 里的被动采样字段）：`known` 有用量和未来的重置时间；`idle` 重置时间已过且此后没有任何采样——Anthropic 的 7 天窗口以第一条消息为起点，所以此时新窗口根本还没开始，账号额度是满的、没有截止时间，留在基础顺序里，调度器绝不自己外推重置时间；`estimated` 是调度器自己的探测开启的窗口（见第 7 步），在拿到真实采样前按"探测时间 + 7 天、向上取整到小时"当作重置时间；`unknown` 字段缺失（sub2api 在每个新的 5 小时窗口会清空它们直到下次采样），回落基础顺序且不会触发保留动作。
 3. **紧急池排序**：距重置不超过 `lookahead_hours`、且剩余额度不少于 `min_urgent_headroom_percent` 的订阅进入紧急池，按 `压力 = 剩余额度 / 距重置小时数` 排序；两个紧急账号只有在压力差超过 `hysteresis_ratio` 时才互换位置，避免抖动。
 4. **写入优先级**：紧急池在前，其余按配置的基础顺序，写成 1..N。只写线上值不同的账号，请求体只有 `priority`。
 5. **执行保留**（标记了 `enforce_ceiling` 的账号）：7 天用量达到 `ceiling_percent` 就设为不可调度直到窗口重置再恢复，且只恢复自己关掉的账号；Fable（`7d_oi`）用量达到 `fable_ceiling_percent` 就写一条分组路由把 `fable_model_pattern` 导向其它账号，重置后撤销。不是自己写的路由一律不动，只告警。
 6. **临期抢流**（可选，`drain_hours`）：某个未被排除的订阅在这么多小时内就要重置时，写一条分组路由（`drain_model_pattern`，默认 `claude-*`）只指向该账号。sub2api 在粘性之前先看路由，所以**已有会话**也会转到它上面；它被限流时 sub2api 回落到正常的优先级选择，恢复后路由再把流量拉回来。每次切换丢一次提示缓存，抢流期间 relay 被绕过。标记了 `enforce_ceiling` 或 `drain_exempt` 的账号永远不会成为抢流目标。
-7. **记录**一行 JSON 决策到 stdout 和 `decisions.jsonl`，并保存一个很小的状态文件。
+7. **重启闲置窗口**（可选，`restart_idle_windows`）：处于 `idle`、状态正常、可调度且未标记 `probe_exempt` 的订阅账号，会通过 sub2api 的账号测试接口收到一条探测消息（一句 "hi"，模型由 `probe_model` 指定，默认 `claude-haiku-4-5-20251001`）。这一条消息足以让 Anthropic 开启下一个 7 天窗口，账号一周后就能再次进入紧急池，而不是永远闲置在 relay 后面。测试接口不会回写用量采样，所以调度器把探测（连同当时看到的那个已结束窗口）记进状态文件，把窗口当作 `estimated`，直到 sub2api 采到任何更新的数据：无论是活跃窗口还是更晚结束的窗口，都会让估算作废。完全没有 7 天采样的账号也按同样方式探测。条件：账号状态正常、可调度或正被本轮解除保留、未标记 `probe_exempt`。两次探测至少间隔 `probe_cooldown_hours`；失败也会记录并在冷却后重试；每轮最多发 3 次探测，每次独立 60 秒超时。探测总是最后执行，不影响本轮排序。
+8. **记录**一行 JSON 决策到 stdout 和 `decisions.jsonl`，并保存一个很小的状态文件。
 
 除保留和抢流之外都是"软"的：只影响**新**会话落在哪里。已有会话由 sub2api 的粘性机制留在原账号，sub2api 自己的限流和阈值逻辑照常生效。
 
@@ -71,12 +72,13 @@ sub2api v0.2.0 自己回答不了这个问题：
 
 ## 配置项
 
-见 [`deploy/config.example.json`](deploy/config.example.json)。各键含义与英文 README 的配置表一致：`base_url`、`admin_key_env`、`mode`、`group_id`、`lookahead_hours`、`min_urgent_headroom_percent`、`hysteresis_ratio`、`default_ceiling_percent`、`default_fable_ceiling_percent`、`fable_model_pattern`、`drain_hours`（默认 0 关闭）、`drain_model_pattern`、`accounts[]`（账号可加 `drain_exempt`）。`kind` 为 `relay` 的账号（看不到内部额度的 API key 中转）永远只按基础顺序排。
+见 [`deploy/config.example.json`](deploy/config.example.json)。各键含义与英文 README 的配置表一致：`base_url`、`admin_key_env`、`mode`、`group_id`、`lookahead_hours`、`min_urgent_headroom_percent`、`hysteresis_ratio`、`default_ceiling_percent`、`default_fable_ceiling_percent`、`fable_model_pattern`、`drain_hours`（默认 0 关闭）、`drain_model_pattern`、`restart_idle_windows`（默认关闭）、`probe_model`、`probe_cooldown_hours`（默认 6）、`accounts[]`（账号可加 `drain_exempt`、`probe_exempt`）。`kind` 为 `relay` 的账号（看不到内部额度的 API key 中转）永远只按基础顺序排。
 
 ## 安全边界
 
 - 读：`GET /api/v1/admin/accounts?group=<id>`、`GET /api/v1/admin/groups/<id>`。
 - 写（仅 apply）：`PUT /api/v1/admin/accounts/<id>` 只带 `priority`；`POST /api/v1/admin/accounts/<id>/schedulable`；`PUT /api/v1/admin/groups/<id>` 只带 `model_routing` 与 `model_routing_enabled`。绝不发送 `extra`、`credentials`、`group_ids`、`status`。
+- 开启 `restart_idle_windows` 后：`POST /api/v1/admin/accounts/<id>/test` 只带 `model_id`，每个账号每个冷却期最多一次、每轮最多三次，且只针对上次采样显示已经结束的窗口（或完全没有采样的账号）。这会通过该账号真实发送一条消息（几百 token）。sub2api 侧的副作用：测试成功会清掉该账号的限流记录；上游返回 403 时 sub2api 会把账号状态置为 `error`，从所有调度中移除，调度器之后既不会再探测也不会恢复它。
 - 任何读取失败或账号缺失都会在写入前中止。
 - admin key 只从环境变量读取，不会出现在任何日志里。详见 [SECURITY.md](SECURITY.md)。
 
@@ -84,7 +86,8 @@ sub2api v0.2.0 自己回答不了这个问题：
 
 - 每个账号只有一个优先级，排序只看账号级 7 天窗口；`7d_oi` 只用于保留。
 - 粒度是 timer 间隔，这不是按请求级的调度器。
-- 被动采样只在账号有请求时刷新；旧样本是安全的下界。
+- 被动采样只在账号有请求时刷新；旧样本是安全的下界。sub2api 的"主动查询"只对 `oauth` 类型账号真正请求 Anthropic，对 `setup-token` 账号只返回本地估算，所以调度器不用它。
+- 探测之后窗口是估算值（探测时间 + 7 天、向上取整到小时），直到该账号第一次真实响应；如果你的套餐窗口锚点不同，以采样到的重置时间为准。决策日志里没有截止时间的窗口 `hours_to_reset` 为 `null`，`headroom_percent` 为完整上限。
 - 它只能引导存在的流量，没人发请求时额度照样过期。
 
 ## 参与

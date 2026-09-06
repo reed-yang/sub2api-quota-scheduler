@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -119,11 +120,11 @@ func TestEvaluateHysteresisKeepsPreviousOrderForClosePressures(t *testing.T) {
 	}
 }
 
-func TestEvaluateSmallHeadroomAndRolledAndUnknownAreNotUrgent(t *testing.T) {
+func TestEvaluateSmallHeadroomAndIdleAndUnknownAreNotUrgent(t *testing.T) {
 	cfg := testConfig()
 	wins := liveWindows()
 	wins[8] = [2]Window{known(92, testNow.Add(29*time.Hour)), known(23, testNow.Add(29*time.Hour))}
-	wins[11] = [2]Window{{State: WindowRolled, Reset: testNow.Add(166 * time.Hour)}, {State: WindowRolled}}
+	wins[11] = [2]Window{{State: WindowIdle, Reset: testNow.Add(-2 * time.Hour)}, {State: WindowIdle}}
 	wins[4] = [2]Window{{State: WindowUnknown}, {State: WindowUnknown}}
 	d, _ := Evaluate(cfg, snaps(cfg, wins, livePriorities()), GroupRouting{}, State{}, testNow)
 	for _, a := range d.Accounts {
@@ -173,8 +174,8 @@ func TestEvaluateReserveDisablesAndReleases(t *testing.T) {
 			t.Fatalf("duplicate disable %+v", a)
 		}
 	}
-	// Window rolled: release only because scheduler disabled it.
-	ss[4].Win7d = Window{State: WindowRolled, Reset: reset.Add(weekly)}
+	// Window ended with no successor: release only because scheduler disabled it.
+	ss[4].Win7d = Window{State: WindowIdle, Reset: reset}
 	d, _ = Evaluate(cfg, ss, GroupRouting{}, d.State, reset.Add(time.Minute))
 	var enable *Action
 	for i := range d.Actions {
@@ -244,8 +245,8 @@ func TestEvaluateFableRoutingSetAndRestored(t *testing.T) {
 	if len(d3.Warnings) == 0 {
 		t.Fatal("expected warning about foreign routing")
 	}
-	// Window rolled: restore empty routing.
-	wins[1] = [2]Window{known(32, reset.Add(weekly)), {State: WindowRolled, Reset: reset.Add(weekly)}}
+	// Fable window ended with no successor: restore empty routing.
+	wins[1] = [2]Window{known(32, reset.Add(weekly)), {State: WindowIdle, Reset: reset}}
 	d4, _ := Evaluate(cfg, snaps(cfg, wins, livePriorities()), live, d.State, reset.Add(time.Minute))
 	var restore *Action
 	for i := range d4.Actions {
@@ -369,7 +370,7 @@ func TestDrainReleasedAfterRolloverAndOnlyWhenOwned(t *testing.T) {
 	cfg := drainConfig()
 	live := GroupRouting{Routing: map[string][]int64{"claude-*": {8}}, Enabled: true}
 	wins := liveWindows()
-	wins[8] = [2]Window{{State: WindowRolled, Reset: testNow.Add(166 * time.Hour)}, {State: WindowRolled, Reset: testNow.Add(166 * time.Hour)}}
+	wins[8] = [2]Window{{State: WindowIdle, Reset: testNow.Add(-time.Hour)}, {State: WindowIdle, Reset: testNow.Add(-time.Hour)}}
 	owned := State{RoutingOwned: true, DrainAccountID: 8, DrainUntil: testNow.Add(-time.Hour).Unix()}
 	d, _ := Evaluate(cfg, snaps(cfg, wins, livePriorities()), live, owned, testNow)
 	r := routingAction(d)
@@ -403,5 +404,328 @@ func TestDrainCombinesWithFableReserve(t *testing.T) {
 	d2, _ := Evaluate(cfg, snaps(cfg, wins, livePriorities()), live, d.State, testNow)
 	if routingAction(d2) != nil {
 		t.Fatalf("idempotency violated: %+v", d2.Actions)
+	}
+}
+
+func probeConfig() *Config {
+	cfg := testConfig()
+	cfg.RestartIdleWindows = true
+	cfg.Accounts[4].ProbeExempt = true // my-sub: the owner starts that window
+	return cfg
+}
+
+var idleEnded = testNow.Add(-24 * time.Hour)
+
+func idleWindows() map[int64][2]Window {
+	wins := liveWindows()
+	wins[8] = [2]Window{{State: WindowIdle, Reset: idleEnded, SampledAt: idleEnded.Add(-3 * time.Hour)}, {State: WindowIdle, Reset: idleEnded}}
+	return wins
+}
+
+// probedState is a delivered probe on my-team whose baseline is idleWindows().
+func probedState(at time.Time) State {
+	return State{Probes: map[int64]ProbeRecord{8: {At: at.Unix(), OK: true, BaselineReset: idleEnded.Unix(), BaselineSampledAt: idleEnded.Add(-3 * time.Hour).Unix()}}}
+}
+
+func probeActions(d Decision) []Action {
+	var out []Action
+	for _, a := range d.Actions {
+		if a.Type == "probe" {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+func TestIdleWindowIsNeverUrgentOrDrained(t *testing.T) {
+	cfg := drainConfig()
+	wins := idleWindows()
+	d, err := Evaluate(cfg, snaps(cfg, wins, livePriorities()), GroupRouting{}, State{}, testNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range d.Accounts {
+		if a.ID == 8 && (a.Urgent || a.Win7d.State != WindowIdle) {
+			t.Fatalf("idle account must not be urgent: %+v", a)
+		}
+	}
+	if d.DrainAccount == 8 {
+		t.Fatalf("idle account must not be drained: %+v", d)
+	}
+	if got := probeActions(d); len(got) != 0 {
+		t.Fatalf("probes are off by default, got %+v", got)
+	}
+}
+
+func TestPlanProbesTargetsIdleActiveSchedulableNonExemptSubscriptions(t *testing.T) {
+	cfg := probeConfig()
+	wins := idleWindows()
+	// my-sub idle too, but probe_exempt.
+	wins[1] = [2]Window{{State: WindowIdle, Reset: testNow.Add(-time.Hour)}, {State: WindowIdle}}
+	d, err := Evaluate(cfg, snaps(cfg, wins, livePriorities()), GroupRouting{}, State{}, testNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := probeActions(d)
+	if len(got) != 1 || got[0].AccountID != 8 || got[0].Model != cfg.ProbeModel || got[0].Result != "" {
+		t.Fatalf("expected one probe for my-team, got %+v", got)
+	}
+	if d.Actions[len(d.Actions)-1].Type != "probe" {
+		t.Fatalf("probe must be the last action: %+v", d.Actions)
+	}
+	// Has a deadline, not active, or unschedulable: no probe.
+	for name, mutate := range map[string]func(ss []AccountSnapshot){
+		"known":        func(ss []AccountSnapshot) { ss[3].Win7d = known(10, testNow.Add(100*time.Hour)) },
+		"error status": func(ss []AccountSnapshot) { ss[3].Status = "error" },
+		"disabled":     func(ss []AccountSnapshot) { ss[3].Schedulable = false },
+	} {
+		ss := snaps(cfg, idleWindows(), livePriorities())
+		mutate(ss)
+		d, _ := Evaluate(cfg, ss, GroupRouting{}, State{}, testNow)
+		if got := probeActions(d); len(got) != 0 {
+			t.Fatalf("%s: unexpected probe %+v", name, got)
+		}
+	}
+	// Never sampled at all: probed like idle, with a distinct reason.
+	ss := snaps(cfg, idleWindows(), livePriorities())
+	ss[3].Win7d = Window{State: WindowUnknown}
+	d, _ = Evaluate(cfg, ss, GroupRouting{}, State{}, testNow)
+	if got := probeActions(d); len(got) != 1 || !strings.Contains(got[0].Reason, "no 7d sample") {
+		t.Fatalf("unknown window must be probed: %+v", d.Actions)
+	}
+	// Idle accounts are logged with no deadline and full headroom.
+	d, _ = Evaluate(cfg, snaps(cfg, idleWindows(), livePriorities()), GroupRouting{}, State{}, testNow)
+	for _, a := range d.Accounts {
+		if a.ID == 8 && (a.HoursToReset != nil || a.Headroom != 95) {
+			t.Fatalf("idle decision fields: %+v", a)
+		}
+		if a.ID == 9 && (a.HoursToReset != nil || a.Headroom != 0) {
+			t.Fatalf("relay decision fields: %+v", a)
+		}
+	}
+}
+
+func TestPlanProbesCapsPerRun(t *testing.T) {
+	cfg := probeConfig()
+	cfg.Accounts[4].ProbeExempt = false
+	cfg.Accounts = append(cfg.Accounts, AccountPolicy{ID: 5, Name: "sub-e", Kind: "subscription"})
+	wins := idleWindows()
+	for _, id := range []int64{11, 4, 1, 5} {
+		wins[id] = [2]Window{{State: WindowIdle, Reset: idleEnded}, {State: WindowIdle}}
+	}
+	d, err := Evaluate(cfg, snaps(cfg, wins, livePriorities()), GroupRouting{}, State{}, testNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := probeActions(d); len(got) != maxProbesPerRun {
+		t.Fatalf("expected %d probes, got %+v", maxProbesPerRun, got)
+	}
+	if len(d.Warnings) == 0 || !strings.Contains(d.Warnings[len(d.Warnings)-1], "probe cap") {
+		t.Fatalf("expected cap warning: %v", d.Warnings)
+	}
+}
+
+func TestReserveReleasesOnIdleAndEstimatedBeforeUntil(t *testing.T) {
+	for _, state := range []WindowState{WindowIdle, WindowEstimated} {
+		cfg := probeConfig()
+		until := testNow.Add(80 * time.Hour)
+		ss := snaps(cfg, liveWindows(), livePriorities())
+		ss[4].Schedulable = false
+		ss[4].Win7d = Window{State: state, Reset: testNow.Add(-2 * time.Hour)}
+		if state == WindowEstimated {
+			ss[4].Win7d.Reset = testNow.Add(150 * time.Hour)
+		}
+		prev := State{DisabledUntil: map[int64]int64{1: until.Unix()}, FableUntil: until.Unix(), RoutingOwned: true}
+		ss[4].WinFable = Window{State: state, Reset: ss[4].Win7d.Reset}
+		live := GroupRouting{Routing: map[string][]int64{"claude-fable-*": {9, 11, 4, 8}}, Enabled: true}
+		d, err := Evaluate(cfg, ss, live, prev, testNow)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !releasesReserve(&d, 1) || len(d.State.DisabledUntil) != 0 {
+			t.Fatalf("%s before until must release the 7d reserve: %+v state=%+v", state, d.Actions, d.State)
+		}
+		if d.State.FableUntil != 0 {
+			t.Fatalf("%s before until must release the Fable reserve: %+v", state, d.State)
+		}
+		r := routingAction(d)
+		if r == nil || r.Enabled || len(r.Routing) != 0 {
+			t.Fatalf("%s: expected routing restored, got %+v", state, d.Actions)
+		}
+	}
+}
+
+func TestProbeEstimateRetiredByNewerSamples(t *testing.T) {
+	cfg := probeConfig()
+	probedAt := testNow.Add(-72 * time.Hour)
+	// A later ended window: idle with a different reset -> record retired, probed again now.
+	ss := snaps(cfg, idleWindows(), livePriorities())
+	ss[3].Win7d = Window{State: WindowIdle, Reset: testNow.Add(-2 * time.Hour), SampledAt: testNow.Add(-time.Hour)}
+	d, _ := Evaluate(cfg, ss, GroupRouting{}, probedState(probedAt), testNow)
+	for _, a := range d.Accounts {
+		if a.ID == 8 && a.Win7d.State != WindowIdle {
+			t.Fatalf("newer ended window must beat the estimate: %+v", a)
+		}
+	}
+	if got := probeActions(d); len(got) != 1 {
+		t.Fatalf("newer ended window must be probed again: %+v", d.Actions)
+	}
+	if _, ok := d.State.Probes[8]; ok {
+		t.Fatalf("stale record must be retired: %+v", d.State.Probes)
+	}
+	// Same ended window but sampled after the probe: also retired.
+	ss = snaps(cfg, idleWindows(), livePriorities())
+	ss[3].Win7d.SampledAt = probedAt.Add(time.Hour)
+	d, _ = Evaluate(cfg, ss, GroupRouting{}, probedState(probedAt), testNow)
+	if _, ok := d.State.Probes[8]; ok || len(probeActions(d)) != 1 {
+		t.Fatalf("post-probe sample of the same ended window must retire the record: %+v %+v", d.State.Probes, d.Actions)
+	}
+	// A live window retires the record too.
+	ss = snaps(cfg, idleWindows(), livePriorities())
+	ss[3].Win7d = known(96, testNow.Add(100*time.Hour))
+	d, _ = Evaluate(cfg, ss, GroupRouting{}, probedState(probedAt), testNow)
+	if _, ok := d.State.Probes[8]; ok {
+		t.Fatalf("known sample must retire the record: %+v", d.State.Probes)
+	}
+	// After that, a wiped (unknown) window must not resurrect the estimate.
+	ss = snaps(cfg, idleWindows(), livePriorities())
+	ss[3].Win7d = Window{State: WindowUnknown}
+	d, _ = Evaluate(cfg, ss, GroupRouting{}, d.State, testNow)
+	for _, a := range d.Accounts {
+		if a.ID == 8 && a.Win7d.State != WindowUnknown {
+			t.Fatalf("retired record must not estimate: %+v", a)
+		}
+	}
+	// An unknown window right after the probe (5h wipe) keeps the estimate.
+	ss = snaps(cfg, idleWindows(), livePriorities())
+	ss[3].Win7d = Window{State: WindowUnknown}
+	d, _ = Evaluate(cfg, ss, GroupRouting{}, probedState(testNow.Add(-time.Hour)), testNow)
+	for _, a := range d.Accounts {
+		if a.ID == 8 && a.Win7d.State != WindowEstimated {
+			t.Fatalf("unknown after probe must keep the estimate: %+v", a)
+		}
+	}
+}
+
+func TestProbeEstimateIsOffWithFeatureOrExemption(t *testing.T) {
+	st := probedState(testNow.Add(-time.Hour))
+	cfg := probeConfig()
+	cfg.RestartIdleWindows = false
+	d, _ := Evaluate(cfg, snaps(cfg, idleWindows(), livePriorities()), GroupRouting{}, st, testNow)
+	for _, a := range d.Accounts {
+		if a.ID == 8 && a.Win7d.State != WindowIdle {
+			t.Fatalf("feature off must drop the estimate: %+v", a)
+		}
+	}
+	if len(probeActions(d)) != 0 {
+		t.Fatalf("feature off must not probe: %+v", d.Actions)
+	}
+	cfg = probeConfig()
+	cfg.Accounts[3].ProbeExempt = true
+	d, _ = Evaluate(cfg, snaps(cfg, idleWindows(), livePriorities()), GroupRouting{}, st, testNow)
+	for _, a := range d.Accounts {
+		if a.ID == 8 && a.Win7d.State != WindowIdle {
+			t.Fatalf("probe_exempt must drop the estimate: %+v", a)
+		}
+	}
+	if len(probeActions(d)) != 0 {
+		t.Fatalf("probe_exempt must not probe: %+v", d.Actions)
+	}
+}
+
+func TestPlanProbesHonoursCooldownAndReserveRelease(t *testing.T) {
+	cfg := probeConfig()
+	recent := State{Probes: map[int64]ProbeRecord{8: {At: testNow.Add(-5 * time.Hour).Unix(), OK: false}}}
+	d, _ := Evaluate(cfg, snaps(cfg, idleWindows(), livePriorities()), GroupRouting{}, recent, testNow)
+	if got := probeActions(d); len(got) != 0 {
+		t.Fatalf("failed probe 5h ago must wait for the 6h cooldown: %+v", got)
+	}
+	old := State{Probes: map[int64]ProbeRecord{8: {At: testNow.Add(-7 * time.Hour).Unix(), OK: false}}}
+	d, _ = Evaluate(cfg, snaps(cfg, idleWindows(), livePriorities()), GroupRouting{}, old, testNow)
+	if got := probeActions(d); len(got) != 1 {
+		t.Fatalf("failed probe 7h ago must be retried: %+v", d.Actions)
+	}
+	if _, ok := d.State.Probes[8]; !ok {
+		t.Fatal("evaluate must carry probe records forward")
+	}
+	// A reserve released in this very run counts as schedulable.
+	sixty := 60.0
+	cfg.Accounts[3].CeilingPercent = &sixty
+	cfg.Accounts[3].EnforceCeiling = true
+	ss := snaps(cfg, idleWindows(), livePriorities())
+	ss[3].Schedulable = false
+	disabled := State{DisabledUntil: map[int64]int64{8: testNow.Add(-24 * time.Hour).Unix()}}
+	d, _ = Evaluate(cfg, ss, GroupRouting{}, disabled, testNow)
+	if !releasesReserve(&d, 8) {
+		t.Fatalf("expected reserve release: %+v", d.Actions)
+	}
+	if got := probeActions(d); len(got) != 1 {
+		t.Fatalf("released account must be probed: %+v", d.Actions)
+	}
+}
+
+func TestProbeEstimateOverlaysIdleWindowUntilSampled(t *testing.T) {
+	cfg := probeConfig()
+	probedAt := testNow.Add(-30 * time.Minute)
+	st := probedState(probedAt)
+	d, _ := Evaluate(cfg, snaps(cfg, idleWindows(), livePriorities()), GroupRouting{}, st, testNow)
+	var mine AccountDecision
+	for _, a := range d.Accounts {
+		if a.ID == 8 {
+			mine = a
+		}
+	}
+	if mine.Win7d.State != WindowEstimated || mine.Urgent || mine.Win7d.UsedPercent != 0 {
+		t.Fatalf("expected estimated, not urgent: %+v", mine)
+	}
+	if h := mine.Win7d.HoursToReset(testNow); h < 167 || h > 169 {
+		t.Fatalf("estimated reset should be about a week out: %v", h)
+	}
+	if got := probeActions(d); len(got) != 0 {
+		t.Fatalf("estimated window must not be probed again: %+v", got)
+	}
+	// Once the estimate is inside the lookahead it is urgent like a known window.
+	later := probedAt.Add(weekly - 48*time.Hour)
+	d, _ = Evaluate(cfg, snaps(cfg, idleWindows(), livePriorities()), GroupRouting{}, st, later)
+	for _, a := range d.Accounts {
+		if a.ID == 8 && (!a.Urgent || a.Win7d.State != WindowEstimated || a.Headroom != 95) {
+			t.Fatalf("estimated window inside lookahead must be urgent: %+v", a)
+		}
+	}
+	// Real sample after the probe wins over the estimate.
+	ss := snaps(cfg, idleWindows(), livePriorities())
+	ss[3].Win7d = known(3, probedAt.Add(weekly))
+	d, _ = Evaluate(cfg, ss, GroupRouting{}, st, testNow)
+	for _, a := range d.Accounts {
+		if a.ID == 8 && (a.Win7d.State != WindowKnown || a.Win7d.UsedPercent != 3) {
+			t.Fatalf("sampled window must replace estimate: %+v", a)
+		}
+	}
+	// Expired estimate with no sample: idle again and probed again.
+	d, _ = Evaluate(cfg, snaps(cfg, idleWindows(), livePriorities()), GroupRouting{}, st, probedAt.Add(weekly+2*time.Hour))
+	if got := probeActions(d); len(got) != 1 {
+		t.Fatalf("expired estimate must lead to a new probe: %+v", d.Actions)
+	}
+	// A failed probe never yields an estimate.
+	failed := State{Probes: map[int64]ProbeRecord{8: {At: probedAt.Unix(), OK: false}}}
+	d, _ = Evaluate(cfg, snaps(cfg, idleWindows(), livePriorities()), GroupRouting{}, failed, testNow)
+	for _, a := range d.Accounts {
+		if a.ID == 8 && a.Win7d.State != WindowIdle {
+			t.Fatalf("failed probe must not estimate: %+v", a)
+		}
+	}
+}
+
+func TestEstimatedWindowCanBeDrained(t *testing.T) {
+	cfg := drainConfig()
+	cfg.RestartIdleWindows = true
+	probedAt := testNow.Add(-weekly + 20*time.Hour)
+	ended := probedAt.Add(-24 * time.Hour)
+	wins := liveWindows()
+	wins[8] = [2]Window{{State: WindowIdle, Reset: ended, SampledAt: ended.Add(-time.Hour)}, {State: WindowIdle, Reset: ended}}
+	st := State{Probes: map[int64]ProbeRecord{8: {At: probedAt.Unix(), OK: true, BaselineReset: ended.Unix(), BaselineSampledAt: ended.Add(-time.Hour).Unix()}}}
+	d, _ := Evaluate(cfg, snaps(cfg, wins, livePriorities()), GroupRouting{}, st, testNow)
+	if d.DrainAccount != 8 {
+		t.Fatalf("estimated window inside drain_hours must be drained: drain=%d actions=%+v", d.DrainAccount, d.Actions)
 	}
 }

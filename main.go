@@ -11,7 +11,7 @@ import (
 )
 
 // version is overridden at release time via -ldflags "-X main.version=...".
-var version = "0.2.0"
+var version = "0.3.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -62,7 +62,9 @@ func command(name string, args []string) error {
 		}
 	}
 	write := name == "run" && cfg.Mode == "apply"
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	// Probes stream a real upstream completion, so allow more than the
+	// loopback reads and writes need.
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
 	d, err := runOnce(ctx, cfg, NewAdminClient(cfg.BaseURL, key), *stateDir, write, now)
 	if err != nil {
@@ -92,7 +94,7 @@ func runOnce(ctx context.Context, cfg *Config, client *AdminClient, stateDir str
 		return Decision{}, err
 	}
 	if write {
-		if errs := Apply(ctx, client, d); len(errs) > 0 {
+		if errs := Apply(ctx, client, &d, now); len(errs) > 0 {
 			for _, e := range errs {
 				d.Warnings = append(d.Warnings, "apply: "+e.Error())
 			}
@@ -101,19 +103,28 @@ func runOnce(ctx context.Context, cfg *Config, client *AdminClient, stateDir str
 		d.Warnings = append(d.Warnings, fmt.Sprintf("dry run (mode=%s): actions not applied", cfg.Mode))
 	}
 	d.State.LastRun = now.UTC().Format(time.RFC3339)
-	if err := AppendDecision(stateDir, d); err != nil {
-		return d, fmt.Errorf("append decision: %w", err)
-	}
+	// State first: a probe that was sent must stay on record even if the
+	// append-only decision log cannot be written.
 	if err := SaveState(stateDir, d.State); err != nil {
 		return d, fmt.Errorf("save state: %w", err)
+	}
+	if err := AppendDecision(stateDir, d); err != nil {
+		return d, fmt.Errorf("append decision: %w", err)
 	}
 	return d, nil
 }
 
-// Apply executes the decision's actions in order and collects errors.
-func Apply(ctx context.Context, c *AdminClient, d Decision) []error {
+// probeTimeout bounds one probe independently of the run context, because a
+// streamed completion can outlast the loopback reads and writes.
+const probeTimeout = 60 * time.Second
+
+// Apply executes the decision's actions in order and collects errors. Probe
+// attempts are recorded in the state (success or failure) so the cooldown and
+// the estimated window follow what was actually sent.
+func Apply(ctx context.Context, c *AdminClient, d *Decision, now time.Time) []error {
 	var errs []error
-	for _, a := range d.Actions {
+	for i := range d.Actions {
+		a := &d.Actions[i]
 		var err error
 		switch a.Type {
 		case "set_priority":
@@ -122,6 +133,35 @@ func Apply(ctx context.Context, c *AdminClient, d Decision) []error {
 			err = c.SetSchedulable(ctx, a.AccountID, a.Value)
 		case "set_routing":
 			err = c.SetRouting(ctx, d.GroupID, a.Routing, a.Enabled)
+		case "probe":
+			if ctx.Err() != nil {
+				// Nothing was sent; leave no record so the cooldown does not start.
+				err = fmt.Errorf("probe account %d skipped: %w", a.AccountID, ctx.Err())
+				a.Result = "skipped: " + ctx.Err().Error()
+				break
+			}
+			pctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+			err = c.ProbeAccount(pctx, a.AccountID, a.Model)
+			cancel()
+			if d.State.Probes == nil {
+				d.State.Probes = map[int64]ProbeRecord{}
+			}
+			rec := ProbeRecord{At: now.Unix(), OK: err == nil}
+			for _, ad := range d.Accounts {
+				if ad.ID == a.AccountID && ad.Win7d.State == WindowIdle {
+					rec.BaselineReset = ad.Win7d.Reset.Unix()
+					if !ad.Win7d.SampledAt.IsZero() {
+						rec.BaselineSampledAt = ad.Win7d.SampledAt.Unix()
+					}
+				}
+			}
+			d.State.Probes[a.AccountID] = rec
+			if err == nil {
+				est, _ := EstimatedWindow(now, now)
+				a.Result = "sent; window estimated to reset at " + est.Reset.Format(time.RFC3339)
+			} else {
+				a.Result = "failed: " + err.Error()
+			}
 		default:
 			err = fmt.Errorf("unknown action %q", a.Type)
 		}

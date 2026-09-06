@@ -12,7 +12,7 @@ const decisionsFile = "decisions.jsonl"
 
 // LoadState reads the persisted state; a missing file yields an empty state.
 func LoadState(dir string) (State, error) {
-	s := State{DisabledUntil: map[int64]int64{}}
+	s := State{DisabledUntil: map[int64]int64{}, Probes: map[int64]ProbeRecord{}}
 	raw, err := os.ReadFile(filepath.Join(dir, stateFile))
 	if errors.Is(err, os.ErrNotExist) {
 		return s, nil
@@ -25,6 +25,9 @@ func LoadState(dir string) (State, error) {
 	}
 	if s.DisabledUntil == nil {
 		s.DisabledUntil = map[int64]int64{}
+	}
+	if s.Probes == nil {
+		s.Probes = map[int64]ProbeRecord{}
 	}
 	return s, nil
 }

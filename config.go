@@ -18,6 +18,9 @@ type AccountPolicy struct {
 	// DrainExempt keeps the account out of drain routing. Accounts with
 	// EnforceCeiling are exempt implicitly.
 	DrainExempt bool `json:"drain_exempt,omitempty"`
+	// ProbeExempt keeps the account out of idle-window probes, for accounts
+	// whose owner starts the window by using it directly.
+	ProbeExempt bool `json:"probe_exempt,omitempty"`
 }
 
 // Config is the on-disk scheduler configuration.
@@ -35,9 +38,15 @@ type Config struct {
 	// DrainHours enables "drain mode": when a non-exempt subscription resets
 	// within this many hours, group routing sends DrainModelPattern to that
 	// account alone so existing sessions move onto it too. 0 disables.
-	DrainHours        float64         `json:"drain_hours"`
-	DrainModelPattern string          `json:"drain_model_pattern"`
-	Accounts          []AccountPolicy `json:"accounts"`
+	DrainHours        float64 `json:"drain_hours"`
+	DrainModelPattern string  `json:"drain_model_pattern"`
+	// RestartIdleWindows sends one small probe message through a subscription
+	// whose 7-day window ended without a successor, so Anthropic starts the
+	// next window instead of leaving the account idle behind the base order.
+	RestartIdleWindows bool            `json:"restart_idle_windows"`
+	ProbeModel         string          `json:"probe_model"`
+	ProbeCooldownHours float64         `json:"probe_cooldown_hours"`
+	Accounts           []AccountPolicy `json:"accounts"`
 }
 
 // LoadConfig reads, defaults, and validates a config file.
@@ -88,6 +97,12 @@ func (c *Config) applyDefaults() {
 	if c.DrainModelPattern == "" {
 		c.DrainModelPattern = "claude-*"
 	}
+	if c.ProbeModel == "" {
+		c.ProbeModel = "claude-haiku-4-5-20251001"
+	}
+	if c.ProbeCooldownHours == 0 {
+		c.ProbeCooldownHours = 6
+	}
 }
 
 func (c *Config) validate() error {
@@ -105,6 +120,9 @@ func (c *Config) validate() error {
 	}
 	if c.DrainHours > 0 && c.DrainModelPattern == c.FableModelPattern {
 		return errors.New("drain_model_pattern must differ from fable_model_pattern")
+	}
+	if c.ProbeCooldownHours < 0 {
+		return errors.New("probe_cooldown_hours must not be negative")
 	}
 	seen := map[int64]bool{}
 	for _, a := range c.Accounts {

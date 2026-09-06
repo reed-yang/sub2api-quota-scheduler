@@ -11,12 +11,16 @@
   "fable_model_pattern": "claude-fable-*",
   "drain_hours": 24,
   "drain_model_pattern": "claude-*",
+  "restart_idle_windows": true,
+  "probe_model": "claude-haiku-4-5-20251001",
+  "probe_cooldown_hours": 6,
   "accounts": [
     { "id": 9, "name": "relay", "kind": "relay" },
     { "id": 11, "name": "sub-a", "kind": "subscription" },
     { "id": 4, "name": "sub-b", "kind": "subscription" },
     { "id": 8, "name": "team-plan", "kind": "subscription" },
     { "id": 1, "name": "personal-max", "kind": "subscription",
-      "ceiling_percent": 60, "fable_ceiling_percent": 80, "enforce_ceiling": true }
+      "ceiling_percent": 60, "fable_ceiling_percent": 80, "enforce_ceiling": true,
+      "probe_exempt": true }
   ]
 }

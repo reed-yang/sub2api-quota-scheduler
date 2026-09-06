@@ -76,9 +76,13 @@ Every run (default: every five minutes):
 2. **Normalize** each subscription's 7-day windows from the passive usage
    fields sub2api stores in `extra`:
    - `known`: utilization plus a future reset timestamp.
-   - `rolled`: the recorded reset is in the past, so the window rolled over
-     and no new sample has arrived; usage is treated as 0 and the reset is
-     advanced by whole weeks.
+   - `idle`: the recorded reset is in the past and nothing has been sampled
+     since. Anthropic anchors the 7-day window to the first message, so no
+     new window exists yet: the account has its full quota, no deadline, and
+     stays in the base order. The scheduler never extrapolates a reset.
+   - `estimated`: the scheduler's own probe started the window (see step 7)
+     and no sample has arrived yet; reset is probe time plus seven days,
+     rounded up to the hour.
    - `unknown`: fields missing (sub2api clears them at each new 5-hour window
      until the next response is sampled); the account falls back to the base
      order and never triggers a reserve action.
@@ -110,7 +114,23 @@ Every run (default: every five minutes):
    traffic back as soon as it recovers. Each switch costs one prompt-cache
    miss, and relays are bypassed while draining. Accounts with
    `enforce_ceiling` or `drain_exempt` are never drained.
-7. **Log** one JSON decision line to stdout and `decisions.jsonl`, and persist
+7. **Restart idle windows** (optional, `restart_idle_windows`): an `idle`
+   subscription that is active, schedulable, and not `probe_exempt` gets one
+   probe through sub2api's account test endpoint: a single "hi" message with
+   `probe_model` (default `claude-haiku-4-5-20251001`). That is enough for
+   Anthropic to open the next 7-day window, so the account can become urgent
+   again a week later instead of sitting idle behind the relay forever. The
+   test endpoint does not sample usage headers, so the scheduler records the
+   probe (with the ended window it saw) in its state file and treats the
+   window as `estimated` (probe time plus seven days, rounded up to the hour)
+   until sub2api samples anything newer: a live window or a later ended one
+   both retire the estimate. Accounts with no 7-day sample at all are probed
+   the same way. Eligibility: active status, schedulable or being re-enabled
+   by this run's reserve release, not `probe_exempt`. Attempts are spaced by
+   `probe_cooldown_hours`, failures are recorded and retried after the
+   cooldown, and a run sends at most three probes, each with its own 60 s
+   timeout. Probes run last and never change the current run's order.
+8. **Log** one JSON decision line to stdout and `decisions.jsonl`, and persist
    a small state file.
 
 Everything except the reserve and drain mode is soft: it only changes where
@@ -203,7 +223,10 @@ See [`deploy/config.example.json`](deploy/config.example.json).
 | `fable_model_pattern` | `claude-fable-*` | routing pattern installed for the Fable reserve |
 | `drain_hours` | `0` (off) | drain mode: route everything to a subscription that resets within this many hours |
 | `drain_model_pattern` | `claude-*` | routing pattern installed while draining |
-| `accounts[]` | required | ordered list; each has `id`, `name`, `kind` (`relay` or `subscription`), optional `ceiling_percent`, `fable_ceiling_percent`, `enforce_ceiling`, `drain_exempt` |
+| `restart_idle_windows` | `false` | probe idle subscriptions so Anthropic starts their next 7-day window |
+| `probe_model` | `claude-haiku-4-5-20251001` | model used for the one-message probe |
+| `probe_cooldown_hours` | `6` | minimum gap between probe attempts on one account |
+| `accounts[]` | required | ordered list; each has `id`, `name`, `kind` (`relay` or `subscription`), optional `ceiling_percent`, `fable_ceiling_percent`, `enforce_ceiling`, `drain_exempt`, `probe_exempt` |
 
 `relay` accounts (API-key relays with no visible quota) always stay in the
 base order. Only the listed accounts are ever read for policy or written.
@@ -229,6 +252,14 @@ a future point in time against live data. `--state-dir` defaults to systemd's
   `model_routing_enabled`. No request ever carries `extra`, `credentials`,
   `group_ids`, or `status`; a full `extra` update in sub2api replaces the map
   and would wipe the passive usage data.
+- With `restart_idle_windows`: `POST /api/v1/admin/accounts/<id>/test` with
+  `{"model_id": ...}`, at most once per cooldown per account and three per
+  run, only for a window sub2api's last sample shows as ended (or an account
+  with no sample). This sends one real message through the account (a few
+  hundred tokens). Side effects inside sub2api: a successful test clears the
+  account's rate-limit bookkeeping; an upstream 403 makes sub2api set the
+  account's status to `error`, which removes it from scheduling everywhere,
+  and the scheduler will neither probe nor re-enable it afterwards.
 - Any fetch failure or missing account aborts the run before any write.
 - All writes go through the audited admin API; nothing touches PostgreSQL or
   Redis directly.
@@ -254,12 +285,22 @@ The scheduler itself is a plain executable and can be run by cron or by hand.
   allocation; this is not a per-request scheduler.
 - Passive usage data is refreshed only when an account serves a request.
   Stale usage is a safe lower bound; the reset timestamp is what matters.
+  sub2api's "active" usage query only reaches Anthropic for `oauth`
+  accounts; for `setup-token` accounts it returns a local estimate, so the
+  scheduler does not use it.
+- After a probe the window is an estimate (probe time plus seven days,
+  rounded up to the hour) until the first real response through that
+  account. If Anthropic anchors the window differently for your plan, the
+  sampled reset wins.
+- In the decision log, `hours_to_reset` is `null` and `headroom_percent` is
+  the full ceiling for windows without a deadline.
 - It can only steer traffic that exists. If nobody sends requests, expiring
   capacity still expires.
 
 ## Roadmap
 
 - [x] Drain mode: move existing sessions onto an expiring account (0.2.0).
+- [x] Restart idle windows with a one-message probe (0.3.0).
 - [ ] Per-model ordering using the `7d_oi` window for Fable-class models.
 - [ ] Weighted allocation across several urgent accounts, if sub2api exposes
       a lever for it (see [#979](https://github.com/Wei-Shaw/sub2api/issues/979)).
@@ -283,6 +324,12 @@ binding when a request fails over (one transient upstream error is enough),
 an account that hits its 5-hour limit is excluded until that window ends, and
 a 7-day window simply cannot be drained in a few hours. Drain mode addresses
 the first two by routing rather than ordering.
+
+**Why does an account that just reset get no traffic for days?**
+Because its next 7-day window has not started: Anthropic opens it at the
+first message, and an account sitting behind the relay in the base order
+never sends one. Enable `restart_idle_windows` and the scheduler sends that
+first message itself, so the account becomes urgent again a week later.
 
 **Why not patch sub2api?**
 Because you would have to re-patch on every release. The sidecar uses public

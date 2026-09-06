@@ -4,6 +4,40 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] - 2026-09-06
+
+### Added
+
+- Optional **idle window restart** (`restart_idle_windows`, default off):
+  Anthropic anchors the 7-day window to the first message, so an account
+  whose reset passed without traffic has no new window and, sitting behind
+  the relay in the base order, never gets one. The scheduler now sends one
+  probe message through sub2api's account test endpoint (`probe_model`,
+  default `claude-haiku-4-5-20251001`) to such accounts, at most once per
+  `probe_cooldown_hours` (default 6) and three per run, and treats the window
+  as `estimated` (probe time plus seven days, rounded up to the hour) until
+  sub2api samples anything newer. Accounts can opt out with `probe_exempt`;
+  turning the feature off also drops every estimate.
+- `probe` actions with `model` and `result` in the decision log; `probes` in
+  the state file.
+
+### Changed
+
+- A passive 7-day reset in the past is now `idle` (full quota, no deadline)
+  instead of `rolled`; the whole-week extrapolation is gone, so an idle
+  account can no longer be promoted for a deadline that does not exist.
+  Idle windows still release scheduler-imposed reserves.
+- `HoursToReset` is `+Inf` for windows without a deadline; the decision log
+  emits `hours_to_reset: null` and the full ceiling as `headroom_percent`
+  for them.
+- Run timeout raised from 90 s to 180 s; each probe has its own 60 s timeout.
+- The state file is saved before the decision log is appended.
+
+### Fixed
+
+- Passive utilization is always a 0-1 fraction; values above 1 (an account
+  over its limit, e.g. `1.03`) were misread as percents.
+
 ## [0.2.0] - 2026-09-05
 
 ### Added

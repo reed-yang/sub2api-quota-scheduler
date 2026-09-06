@@ -60,3 +60,23 @@ func TestLoadConfigDrainValidation(t *testing.T) {
 		t.Fatal("drain pattern equal to fable pattern must fail")
 	}
 }
+
+func TestLoadConfigProbeDefaultsAndValidation(t *testing.T) {
+	cfg, err := LoadConfig(writeTemp(t, `{"group_id":12,"accounts":[{"id":1,"name":"a","kind":"subscription","probe_exempt":true},{"id":2,"name":"b","kind":"subscription"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.RestartIdleWindows || cfg.ProbeModel != "claude-haiku-4-5-20251001" || cfg.ProbeCooldownHours != 6 {
+		t.Fatalf("probe defaults: %+v", cfg)
+	}
+	if !cfg.Accounts[0].ProbeExempt || cfg.Accounts[1].ProbeExempt {
+		t.Fatalf("probe_exempt not honoured: %+v", cfg.Accounts)
+	}
+	cfg, err = LoadConfig(writeTemp(t, `{"group_id":12,"restart_idle_windows":true,"probe_model":"claude-sonnet-4-5-20250929","probe_cooldown_hours":12,"accounts":[{"id":1,"name":"a","kind":"subscription"}]}`))
+	if err != nil || !cfg.RestartIdleWindows || cfg.ProbeModel != "claude-sonnet-4-5-20250929" || cfg.ProbeCooldownHours != 12 {
+		t.Fatalf("cfg=%+v err=%v", cfg, err)
+	}
+	if _, err := LoadConfig(writeTemp(t, `{"group_id":12,"probe_cooldown_hours":-1,"accounts":[{"id":1,"name":"a","kind":"subscription"}]}`)); err == nil {
+		t.Fatal("negative probe_cooldown_hours must fail")
+	}
+}

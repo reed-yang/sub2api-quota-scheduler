@@ -193,6 +193,10 @@ func (c *AdminClient) ProbeAccount(ctx context.Context, id int64, model string) 
 					return fmt.Errorf("probe account %d: %s", id, ev.Error)
 				case "test_complete":
 					if ev.Success && sawContent {
+						// Drain to EOF so sub2api's handler finishes with a live
+						// request context; it runs its post-test account recovery
+						// after the last event, and hanging up early cancels that.
+						_, _ = io.Copy(io.Discard, reader)
 						return nil
 					}
 					if ev.Success {

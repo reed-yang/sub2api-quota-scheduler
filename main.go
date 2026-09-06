@@ -11,7 +11,7 @@ import (
 )
 
 // version is overridden at release time via -ldflags "-X main.version=...".
-var version = "0.3.0"
+var version = "0.3.1"
 
 func main() {
 	if len(os.Args) < 2 {

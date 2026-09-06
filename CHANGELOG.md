@@ -4,6 +4,15 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.3.1] - 2026-09-06
+
+### Fixed
+
+- The probe client now drains the test stream to EOF after `test_complete`.
+  Hanging up on the first completion event cancelled sub2api's request
+  context before its post-test account recovery ran (logged upstream as
+  `context canceled`), so the documented rate-limit cleanup never happened.
+
 ## [0.3.0] - 2026-09-06
 
 ### Added

@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -18,6 +19,9 @@ type recorded struct {
 	Method, Path, Key string
 	Body              map[string]any
 }
+
+// handlerFinished records that the account-1 test handler ran to completion.
+var handlerFinished atomic.Bool
 
 func newServer(t *testing.T, rec *[]recorded) *httptest.Server {
 	t.Helper()
@@ -43,6 +47,13 @@ func newServerWithReset(t *testing.T, rec *[]recorded, reset int64) *httptest.Se
 		case r.Method == "POST" && r.URL.Path == "/api/v1/admin/accounts/1/test":
 			w.Header().Set("Content-Type", "text/event-stream")
 			_, _ = w.Write([]byte("data: {\"type\":\"test_start\",\"model\":\"claude-haiku-4-5-20251001\"}\n\ndata: {\"type\":\"content\",\"text\":\"Hi!\"}\n\ndata: {\"type\":\"test_complete\",\"success\":true}\n\n"))
+			// Post-test work in sub2api happens after the last event; the
+			// client must keep the connection open until the handler returns.
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			time.Sleep(60 * time.Millisecond)
+			handlerFinished.Store(true)
 		case r.Method == "POST" && r.URL.Path == "/api/v1/admin/accounts/2/test":
 			w.Header().Set("Content-Type", "text/event-stream")
 			_, _ = w.Write([]byte("data: {\"type\":\"test_start\",\"model\":\"claude-haiku-4-5-20251001\"}\n\ndata: {\"type\":\"error\",\"error\":\"API returned 429: rate limited\"}\n\n"))
@@ -159,8 +170,12 @@ func TestClientProbeParsesSSEOutcome(t *testing.T) {
 	defer srv.Close()
 	c := NewAdminClient(srv.URL, "admin-test")
 	ctx := context.Background()
+	handlerFinished.Store(false)
 	if err := c.ProbeAccount(ctx, 1, "claude-haiku-4-5-20251001"); err != nil {
 		t.Fatalf("successful probe: %v", err)
+	}
+	if !handlerFinished.Load() {
+		t.Fatal("probe returned before the server handler finished; the stream must be drained to EOF")
 	}
 	if rec[0].Method != "POST" || rec[0].Path != "/api/v1/admin/accounts/1/test" || rec[0].Body["model_id"] != "claude-haiku-4-5-20251001" || len(rec[0].Body) != 1 {
 		t.Fatalf("probe request=%+v", rec[0])

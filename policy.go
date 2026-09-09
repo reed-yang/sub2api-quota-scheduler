@@ -40,6 +40,9 @@ type ProbeRecord struct {
 // idle accounts cannot stretch a run past the systemd timer interval.
 const maxProbesPerRun = 3
 
+// Final-window promotion is independent of pressure and minimum headroom.
+const finalWindowHours = 5
+
 // State is persisted between runs.
 type State struct {
 	LastOrder     []int64         `json:"last_order"`
@@ -95,6 +98,7 @@ type AccountDecision struct {
 	HoursToReset    *float64 `json:"hours_to_reset"`
 	Pressure        float64  `json:"pressure"`
 	Urgent          bool     `json:"urgent"`
+	FinalWindow     bool     `json:"final_window"`
 	CurrentPriority int      `json:"current_priority"`
 	TargetPriority  int      `json:"target_priority"`
 }
@@ -137,7 +141,7 @@ func Evaluate(cfg *Config, snaps []AccountSnapshot, group GroupRouting, prev Sta
 	applyProbeEstimates(cfg, byID, &d, now)
 	// Pre-size Accounts so the per-account pointers below stay valid across appends.
 	d.Accounts = make([]AccountDecision, 0, len(cfg.Accounts))
-	var urgent, normal []candidate
+	var finalWindow, urgent, normal []candidate
 	for i, a := range cfg.Accounts {
 		s := byID[a.ID]
 		s.BaseIndex = i
@@ -152,7 +156,14 @@ func Evaluate(cfg *Config, snaps []AccountSnapshot, group GroupRouting, prev Sta
 			hours := s.Win7d.HoursToReset(now)
 			headroom := c.decision.Headroom
 			c.decision.HoursToReset = &hours
-			if hours <= cfg.LookaheadHours && headroom >= cfg.MinUrgentHeadroomPercent {
+			if hours > 0 && hours <= finalWindowHours && headroom > 0 && s.Schedulable && s.Status == "active" {
+				c.decision.Pressure = headroom / math.Max(hours, 1)
+				c.decision.Urgent = true
+				c.decision.FinalWindow = true
+				finalWindow = append(finalWindow, c)
+				continue
+			}
+			if hours > 0 && hours <= cfg.LookaheadHours && headroom >= cfg.MinUrgentHeadroomPercent {
 				c.decision.Pressure = headroom / math.Max(hours, 1)
 				c.decision.Urgent = true
 				urgent = append(urgent, c)
@@ -162,15 +173,27 @@ func Evaluate(cfg *Config, snaps []AccountSnapshot, group GroupRouting, prev Sta
 		normal = append(normal, c)
 	}
 
+	sort.SliceStable(finalWindow, func(i, j int) bool {
+		a, b := finalWindow[i], finalWindow[j]
+		if !a.snap.Win7d.Reset.Equal(b.snap.Win7d.Reset) {
+			return a.snap.Win7d.Reset.Before(b.snap.Win7d.Reset)
+		}
+		if a.decision.Headroom != b.decision.Headroom {
+			return a.decision.Headroom > b.decision.Headroom
+		}
+		return a.snap.BaseIndex < b.snap.BaseIndex
+	})
 	sortUrgent(urgent, prev.LastOrder, cfg.HysteresisRatio)
-	ordered := append(urgent, normal...)
+	ordered := append(append(finalWindow, urgent...), normal...)
 	for pos, c := range ordered {
 		target := pos + 1
 		c.decision.TargetPriority = target
 		d.TargetOrder = append(d.TargetOrder, c.snap.Policy.ID)
 		if c.snap.Priority != target {
 			reason := "base order"
-			if c.decision.Urgent {
+			if c.decision.FinalWindow {
+				reason = fmt.Sprintf("final 5h: headroom %.1f%%, reset in %.1fh", c.decision.Headroom, *c.decision.HoursToReset)
+			} else if c.decision.Urgent {
 				reason = fmt.Sprintf("urgent: headroom %.1f%% over %.1fh", c.decision.Headroom, *c.decision.HoursToReset)
 			}
 			d.Actions = append(d.Actions, Action{Type: "set_priority", AccountID: c.snap.Policy.ID, From: c.snap.Priority, To: target, Reason: reason})
@@ -296,11 +319,12 @@ func selectDrainTarget(cfg *Config, d *Decision, byID map[int64]AccountSnapshot,
 			continue
 		}
 		s := byID[a.ID]
-		if !s.Schedulable || !s.Win7d.HasDeadline() {
+		if !s.Schedulable || s.Status != "active" || !s.Win7d.HasDeadline() {
 			continue
 		}
 		ceiling, _ := cfg.Ceiling(a)
-		if s.Win7d.UsedPercent >= ceiling || s.Win7d.HoursToReset(now) > cfg.DrainHours {
+		hours := s.Win7d.HoursToReset(now)
+		if s.Win7d.UsedPercent >= ceiling || hours <= 0 || hours > cfg.DrainHours {
 			continue
 		}
 		if best == nil || s.Win7d.Reset.Before(best.Win7d.Reset) || (s.Win7d.Reset.Equal(best.Win7d.Reset) && s.Win7d.UsedPercent < best.Win7d.UsedPercent) {

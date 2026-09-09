@@ -25,7 +25,7 @@ func TestLoadConfigDefaultsAndCeilings(t *testing.T) {
 		t.Fatalf("defaults: %+v", cfg)
 	}
 	c, f := cfg.Ceiling(cfg.Accounts[0])
-	if c != 95 || f != 95 {
+	if c != 100 || f != 100 {
 		t.Fatalf("relay ceilings %v %v", c, f)
 	}
 	c, f = cfg.Ceiling(cfg.Accounts[1])

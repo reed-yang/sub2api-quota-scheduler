@@ -140,8 +140,11 @@ func (c *Config) validate() error {
 	return nil
 }
 
-// Ceiling returns the effective 7d and Fable ceilings for an account.
+// Ceiling returns enforced reserves, or full capacity for unreserved accounts.
 func (c *Config) Ceiling(a AccountPolicy) (ceiling, fable float64) {
+	if !a.EnforceCeiling {
+		return 100, 100
+	}
 	ceiling, fable = c.DefaultCeilingPercent, c.DefaultFableCeilingPercent
 	if a.CeilingPercent != nil {
 		ceiling = *a.CeilingPercent

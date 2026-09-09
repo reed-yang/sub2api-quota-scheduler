@@ -95,8 +95,8 @@ func TestEvaluateNoUrgencyKeepsBaseOrderAndNoWritesWhenUnchanged(t *testing.T) {
 func TestEvaluateUrgentTierSortsByPressureThenReset(t *testing.T) {
 	cfg := testConfig()
 	wins := liveWindows()
-	wins[4] = [2]Window{known(10, testNow.Add(48*time.Hour)), known(10, testNow.Add(48*time.Hour))} // headroom 85 / 48h = 1.77
-	// my-team: headroom 79 / 29h = 2.72 -> first
+	wins[4] = [2]Window{known(10, testNow.Add(48*time.Hour)), known(10, testNow.Add(48*time.Hour))} // headroom 90 / 48h = 1.875
+	// my-team: headroom 84 / 29h = 2.90 -> first
 	d, _ := Evaluate(cfg, snaps(cfg, wins, livePriorities()), GroupRouting{}, State{}, testNow)
 	if d.TargetOrder[0] != 8 || d.TargetOrder[1] != 4 || d.TargetOrder[2] != 9 {
 		t.Fatalf("order=%v", d.TargetOrder)
@@ -106,14 +106,14 @@ func TestEvaluateUrgentTierSortsByPressureThenReset(t *testing.T) {
 func TestEvaluateHysteresisKeepsPreviousOrderForClosePressures(t *testing.T) {
 	cfg := testConfig()
 	wins := liveWindows()
-	wins[8] = [2]Window{known(20, testNow.Add(40*time.Hour)), known(20, testNow.Add(40*time.Hour))} // 75/40 = 1.875
-	wins[4] = [2]Window{known(15, testNow.Add(40*time.Hour)), known(15, testNow.Add(40*time.Hour))} // 80/40 = 2.0, within 20%
+	wins[8] = [2]Window{known(20, testNow.Add(40*time.Hour)), known(20, testNow.Add(40*time.Hour))} // 80/40 = 2.0
+	wins[4] = [2]Window{known(15, testNow.Add(40*time.Hour)), known(15, testNow.Add(40*time.Hour))} // 85/40 = 2.125, within 20%
 	prev := State{LastOrder: []int64{8, 4, 9, 11, 1}}
 	d, _ := Evaluate(cfg, snaps(cfg, wins, livePriorities()), GroupRouting{}, prev, testNow)
 	if d.TargetOrder[0] != 8 || d.TargetOrder[1] != 4 {
 		t.Fatalf("hysteresis violated: %v", d.TargetOrder)
 	}
-	wins[4] = [2]Window{known(0, testNow.Add(40*time.Hour)), known(0, testNow.Add(40*time.Hour))} // 95/40 = 2.375 > 1.875*1.2
+	wins[4] = [2]Window{known(0, testNow.Add(40*time.Hour)), known(0, testNow.Add(40*time.Hour))} // 100/40 = 2.5 > 2.0*1.2
 	d, _ = Evaluate(cfg, snaps(cfg, wins, livePriorities()), GroupRouting{}, prev, testNow)
 	if d.TargetOrder[0] != 4 {
 		t.Fatalf("expected reorder: %v", d.TargetOrder)
@@ -123,7 +123,7 @@ func TestEvaluateHysteresisKeepsPreviousOrderForClosePressures(t *testing.T) {
 func TestEvaluateSmallHeadroomAndIdleAndUnknownAreNotUrgent(t *testing.T) {
 	cfg := testConfig()
 	wins := liveWindows()
-	wins[8] = [2]Window{known(92, testNow.Add(29*time.Hour)), known(23, testNow.Add(29*time.Hour))}
+	wins[8] = [2]Window{known(97, testNow.Add(29*time.Hour)), known(23, testNow.Add(29*time.Hour))}
 	wins[11] = [2]Window{{State: WindowIdle, Reset: testNow.Add(-2 * time.Hour)}, {State: WindowIdle}}
 	wins[4] = [2]Window{{State: WindowUnknown}, {State: WindowUnknown}}
 	d, _ := Evaluate(cfg, snaps(cfg, wins, livePriorities()), GroupRouting{}, State{}, testNow)
@@ -144,6 +144,114 @@ func TestEvaluateMySubUsesItsOwnCeilingForUrgency(t *testing.T) {
 	d, _ := Evaluate(cfg, snaps(cfg, wins, livePriorities()), GroupRouting{}, State{}, testNow)
 	if d.TargetOrder[0] != 8 || d.TargetOrder[1] != 1 || d.TargetOrder[2] != 9 {
 		t.Fatalf("order=%v", d.TargetOrder)
+	}
+}
+
+func TestFinalWindowPriorityBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		remaining   time.Duration
+		used        float64
+		state       WindowState
+		schedulable bool
+		status      string
+		wantFirst   bool
+	}{
+		{"five hours", 5 * time.Hour, 99, WindowKnown, true, "active", true},
+		{"just outside", 5*time.Hour + time.Second, 99, WindowKnown, true, "active", false},
+		{"almost reset", time.Second, 99.9, WindowKnown, true, "active", true},
+		{"at reset", 0, 99, WindowKnown, true, "active", false},
+		{"past reset", -time.Second, 99, WindowKnown, true, "active", false},
+		{"exhausted", time.Hour, 100, WindowKnown, true, "active", false},
+		{"idle", time.Hour, 0, WindowIdle, true, "active", false},
+		{"unknown", time.Hour, 0, WindowUnknown, true, "active", false},
+		{"estimated", time.Hour, 0, WindowEstimated, true, "active", true},
+		{"disabled", time.Hour, 99, WindowKnown, false, "active", false},
+		{"error", time.Hour, 99, WindowKnown, true, "error", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := testConfig()
+			cfg.LookaheadHours = 0.5
+			wins := liveWindows()
+			wins[8] = [2]Window{{State: tc.state, UsedPercent: tc.used, Reset: testNow.Add(tc.remaining)}, known(100, testNow.Add(time.Hour))}
+			ss := snaps(cfg, wins, livePriorities())
+			ss[3].Schedulable, ss[3].Status = tc.schedulable, tc.status
+			d, err := Evaluate(cfg, ss, GroupRouting{}, State{LastOrder: []int64{9, 11, 4, 1, 8}}, testNow)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if (d.TargetOrder[0] == 8) != tc.wantFirst {
+				t.Fatalf("order=%v wantFirst=%v", d.TargetOrder, tc.wantFirst)
+			}
+			for _, a := range d.Actions {
+				if a.Type == "set_schedulable" || a.Type == "set_routing" {
+					t.Fatalf("priority promotion must not change availability or routing: %+v", a)
+				}
+			}
+		})
+	}
+}
+
+func TestFinalWindowOutranksPressureAndHysteresis(t *testing.T) {
+	cfg := testConfig()
+	wins := liveWindows()
+	wins[11] = [2]Window{known(0, testNow.Add(6*time.Hour)), {State: WindowUnknown}}
+	wins[4] = [2]Window{known(0, testNow.Add(5*time.Hour)), {State: WindowUnknown}}
+	wins[8] = [2]Window{known(99, testNow.Add(4*time.Hour)), known(100, testNow.Add(4*time.Hour))}
+	d, err := Evaluate(cfg, snaps(cfg, wins, livePriorities()), GroupRouting{}, State{LastOrder: []int64{11, 4, 8, 9, 1}}, testNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.TargetOrder[0] != 8 || d.TargetOrder[1] != 4 || d.TargetOrder[2] != 11 {
+		t.Fatalf("final window must outrank pressure and previous order: %v", d.TargetOrder)
+	}
+}
+
+func TestFinalWindowPreservesPersonal95PercentReserve(t *testing.T) {
+	for _, used := range []float64{94.9, 95, 99} {
+		cfg := testConfig()
+		limit := 95.0
+		cfg.Accounts[4].CeilingPercent, cfg.Accounts[4].FableCeilingPercent = &limit, &limit
+		wins := liveWindows()
+		wins[1] = [2]Window{known(used, testNow.Add(time.Hour)), known(95, testNow.Add(time.Hour))}
+		d, err := Evaluate(cfg, snaps(cfg, wins, livePriorities()), GroupRouting{}, State{}, testNow)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if (d.TargetOrder[0] == 1) != (used < 95) {
+			t.Fatalf("used=%v order=%v", used, d.TargetOrder)
+		}
+		disabled := false
+		for _, a := range d.Actions {
+			if a.Type == "set_schedulable" && a.AccountID == 1 && !a.Value {
+				disabled = true
+			}
+		}
+		if disabled != (used >= 95) {
+			t.Fatalf("used=%v disabled=%v", used, disabled)
+		}
+		r := routingAction(d)
+		if r == nil || len(r.Routing[cfg.FableModelPattern]) != 4 {
+			t.Fatalf("Fable reserve must remain active: %+v", d.Actions)
+		}
+		for _, id := range r.Routing[cfg.FableModelPattern] {
+			if id == 1 {
+				t.Fatal("personal reserve must exclude Fable traffic")
+			}
+		}
+	}
+}
+
+func TestDrainConsumesUnreservedRemainderWithFableExhausted(t *testing.T) {
+	cfg := drainConfig()
+	wins := liveWindows()
+	wins[8] = [2]Window{known(99, testNow.Add(3*time.Hour)), known(100, testNow.Add(3*time.Hour))}
+	d, err := Evaluate(cfg, snaps(cfg, wins, livePriorities()), GroupRouting{}, State{}, testNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.DrainAccount != 8 || d.TargetOrder[0] != 8 {
+		t.Fatalf("remaining 7d quota must stay available for other models: %+v", d)
 	}
 }
 
@@ -347,7 +455,7 @@ func TestDrainIgnoresAccountsOutsideWindowUnschedulableOrExhausted(t *testing.T)
 	if routingAction(d) != nil {
 		t.Fatalf("no account within 24h: %+v", d.Actions)
 	}
-	wins[8] = [2]Window{known(96, testNow.Add(3*time.Hour)), known(25, testNow.Add(3*time.Hour))} // exhausted
+	wins[8] = [2]Window{known(100, testNow.Add(3*time.Hour)), known(25, testNow.Add(3*time.Hour))} // exhausted
 	d, _ = Evaluate(cfg, snaps(cfg, wins, livePriorities()), GroupRouting{}, State{}, testNow)
 	if routingAction(d) != nil {
 		t.Fatalf("exhausted account must not be drained: %+v", d.Actions)
@@ -496,7 +604,7 @@ func TestPlanProbesTargetsIdleActiveSchedulableNonExemptSubscriptions(t *testing
 	// Idle accounts are logged with no deadline and full headroom.
 	d, _ = Evaluate(cfg, snaps(cfg, idleWindows(), livePriorities()), GroupRouting{}, State{}, testNow)
 	for _, a := range d.Accounts {
-		if a.ID == 8 && (a.HoursToReset != nil || a.Headroom != 95) {
+		if a.ID == 8 && (a.HoursToReset != nil || a.Headroom != 100) {
 			t.Fatalf("idle decision fields: %+v", a)
 		}
 		if a.ID == 9 && (a.HoursToReset != nil || a.Headroom != 0) {
@@ -688,7 +796,7 @@ func TestProbeEstimateOverlaysIdleWindowUntilSampled(t *testing.T) {
 	later := probedAt.Add(weekly - 48*time.Hour)
 	d, _ = Evaluate(cfg, snaps(cfg, idleWindows(), livePriorities()), GroupRouting{}, st, later)
 	for _, a := range d.Accounts {
-		if a.ID == 8 && (!a.Urgent || a.Win7d.State != WindowEstimated || a.Headroom != 95) {
+		if a.ID == 8 && (!a.Urgent || a.Win7d.State != WindowEstimated || a.Headroom != 100) {
 			t.Fatalf("estimated window inside lookahead must be urgent: %+v", a)
 		}
 	}

@@ -141,6 +141,9 @@ func Evaluate(cfg *Config, snaps []AccountSnapshot, group GroupRouting, prev Sta
 	applyProbeEstimates(cfg, byID, &d, now)
 	// Pre-size Accounts so the per-account pointers below stay valid across appends.
 	d.Accounts = make([]AccountDecision, 0, len(cfg.Accounts))
+	// Accounts whose window this run discarded as stale. They have no deadline
+	// now, which would otherwise read as "never sampled" and earn a probe.
+	downgraded := map[int64]bool{}
 	var finalWindow, urgent, normal []candidate
 	for i, a := range cfg.Accounts {
 		s := byID[a.ID]
@@ -148,6 +151,11 @@ func Evaluate(cfg *Config, snaps []AccountSnapshot, group GroupRouting, prev Sta
 		if reason := staleWindow(a, s.Win7d, now); reason != "" {
 			d.Warnings = append(d.Warnings, fmt.Sprintf("account %d (%s): %s; ranking it without a window", a.ID, a.Name, reason))
 			s.Win7d, s.WinFable = Window{State: WindowUnknown}, Window{State: WindowUnknown}
+			// Write back: reserve enforcement, drain selection and probe
+			// planning all re-read the map, and a guard that only reached the
+			// ranking would still let a frozen window drive routing.
+			byID[a.ID] = s
+			downgraded[a.ID] = true
 		}
 		ceiling, fable := cfg.Ceiling(a)
 		ad := AccountDecision{ID: a.ID, Name: a.Name, Kind: a.Kind, Schedulable: s.Schedulable, Win7d: s.Win7d, WinFable: s.WinFable, Ceiling: ceiling, FableCeiling: fable, CurrentPriority: s.Priority}
@@ -226,7 +234,7 @@ func Evaluate(cfg *Config, snaps []AccountSnapshot, group GroupRouting, prev Sta
 		d.State.DrainAccountID, d.State.DrainUntil = 0, 0
 	}
 	reconcileRouting(cfg, &d, group, desired)
-	planProbes(cfg, &d, byID, now)
+	planProbes(cfg, &d, byID, downgraded, now)
 	return d, nil
 }
 
@@ -268,7 +276,7 @@ func applyProbeEstimates(cfg *Config, byID map[int64]AccountSnapshot, d *Decisio
 // deadline (idle, or never sampled) whose window should be started, at most
 // maxProbesPerRun per run. Probes come after every other action and never
 // affect the current run's ordering.
-func planProbes(cfg *Config, d *Decision, byID map[int64]AccountSnapshot, now time.Time) {
+func planProbes(cfg *Config, d *Decision, byID map[int64]AccountSnapshot, downgraded map[int64]bool, now time.Time) {
 	if !cfg.RestartIdleWindows {
 		return
 	}
@@ -280,6 +288,12 @@ func planProbes(cfg *Config, d *Decision, byID map[int64]AccountSnapshot, now ti
 			return
 		}
 		if a.Kind != "subscription" || a.ProbeExempt {
+			continue
+		}
+		// A window this run discarded is a broken external sync, not an idle
+		// account: probing would send a real message and start a window on
+		// whatever the relay points at.
+		if downgraded[a.ID] {
 			continue
 		}
 		s := byID[a.ID]
@@ -315,11 +329,21 @@ func staleWindow(a AccountPolicy, w Window, now time.Time) string {
 	if w.SampledAt.IsZero() {
 		return fmt.Sprintf("7d window carries no sample time but window_max_age_hours is %.1f", a.WindowMaxAgeHours)
 	}
-	if age := now.Sub(w.SampledAt).Hours(); age > a.WindowMaxAgeHours {
-		return fmt.Sprintf("7d sample is %.1fh old, past window_max_age_hours %.1f", age, a.WindowMaxAgeHours)
+	age := now.Sub(w.SampledAt)
+	if age < -clockSkewMargin {
+		// A sample dated in the future never ages out, so a skewed writer would
+		// pin the account as permanently fresh.
+		return fmt.Sprintf("7d sample is dated %.1fh in the future", -age.Hours())
+	}
+	if age.Hours() > a.WindowMaxAgeHours {
+		return fmt.Sprintf("7d sample is %.1fh old, past window_max_age_hours %.1f", age.Hours(), a.WindowMaxAgeHours)
 	}
 	return ""
 }
+
+// clockSkewMargin tolerates ordinary NTP drift between hosts before a sample
+// dated in the future is treated as unusable.
+const clockSkewMargin = 5 * time.Minute
 
 // releasesReserve reports whether this decision re-enables the account.
 func releasesReserve(d *Decision, id int64) bool {

@@ -984,3 +984,43 @@ func TestWindowMaxAgeUnsetLeavesPassiveSamplesAlone(t *testing.T) {
 		t.Fatalf("order %v warnings %v", d.TargetOrder, d.Warnings)
 	}
 }
+
+// The staleness downgrade has to reach the map that reserve enforcement, drain
+// selection and probe planning all re-read. A guard that only reached the
+// ranking would leave a frozen window driving routing.
+func TestStaleSyncedWindowIsNotDrainedOrProbed(t *testing.T) {
+	cfg := relayConfig(1)
+	cfg.DrainHours = 24
+	cfg.Accounts[0].DrainExempt = false
+	cfg.Accounts[0].ProbeExempt = false
+	wins := liveWindows()
+	// Deep inside drain_hours with quota left: the obvious drain target if the
+	// window still counted.
+	fresh := sampled(known(40, testNow.Add(6*time.Hour)), testNow.Add(-10*time.Minute))
+	wins[9] = [2]Window{fresh, fresh}
+	d, err := Evaluate(cfg, snaps(cfg, wins, livePriorities()), GroupRouting{}, State{}, testNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.DrainAccount != 9 {
+		t.Fatalf("drain account %d, want 9 while its sample is fresh", d.DrainAccount)
+	}
+
+	stale := sampled(known(40, testNow.Add(6*time.Hour)), testNow.Add(-90*time.Minute))
+	wins[9] = [2]Window{stale, stale}
+	d, err = Evaluate(cfg, snaps(cfg, wins, livePriorities()), GroupRouting{}, State{}, testNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.DrainAccount == 9 {
+		t.Fatal("a discarded window must not select the account as a drain target")
+	}
+	for _, a := range d.Actions {
+		if a.Type == "probe" && a.AccountID == 9 {
+			t.Fatal("a broken sync must not send a real message through the relay")
+		}
+		if a.Type == "set_routing" {
+			t.Fatalf("stale sample must not install routing: %+v", a)
+		}
+	}
+}

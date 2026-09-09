@@ -43,7 +43,7 @@ sub2api v0.2.0 自己回答不了这个问题：
 1. **读取**分组账号和分组模型路由。任一配置账号缺失或不在分组内，本轮直接放弃、不写任何东西。
 2. **归一化**每个订阅账号的 7 天窗口（来自 sub2api 存在 `extra` 里的被动采样字段）：`known` 有用量和未来的重置时间；`idle` 重置时间已过且此后没有任何采样——Anthropic 的 7 天窗口以第一条消息为起点，所以此时新窗口根本还没开始，账号额度是满的、没有截止时间，留在基础顺序里，调度器绝不自己外推重置时间；`estimated` 是调度器自己的探测开启的窗口（见第 7 步），在拿到真实采样前按"探测时间 + 7 天、向上取整到小时"当作重置时间；`unknown` 字段缺失（sub2api 在每个新的 5 小时窗口会清空它们直到下次采样），回落基础顺序且不会触发保留动作。
 3. **最后 5 小时最高优先级**：状态正常、可调度、7d 仍有可用额度且将在 5 小时内重置的订阅，直接排在所有其它账号之前，不受 `lookahead_hours`、最小余量或滞回限制。同档先用更早重置的账号，再比较剩余额度，最后按基础顺序。未启用 `enforce_ceiling` 的账号按 100% 计算容量，启用了保留的账号仍遵守自身上限。Fable 子窗口已满不会排除仍可供 Opus 等模型消耗的 7d 额度。**其后紧急池排序**：距重置不超过 `lookahead_hours`、且剩余额度不少于 `min_urgent_headroom_percent` 的订阅进入紧急池，按 `压力 = 剩余额度 / 距重置小时数` 排序；两个紧急账号只有在压力差超过 `hysteresis_ratio` 时才互换位置，避免抖动。
-4. **写入优先级**：最后 5 小时档、紧急池、其余账号依次排列，其余按配置的基础顺序，写成 1..N。只写线上值不同的账号，请求体只有 `priority`。
+4. **写入优先级**：最后 5 小时档、紧急池、其余账号依次排列，其余按配置的基础顺序，写成 1..N。设置了 `window_max_age_hours` 的账号先做一次时效检查：7d 采样比它更旧、或者根本没有采样时间，就打一条 warning 并当作没有窗口来排。sub2api 自己采样的窗口不要设这个值——它们不会过期，因为只有账号服务请求时窗口才会变，而那次请求本身就会重新采样。只有窗口由调度器之外的东西写入时才需要设：写入方一停，账号退回基础顺序，而不是继续按一组已经不再变化的数字排序。只写线上值不同的账号，请求体只有 `priority`。
 5. **执行保留**（标记了 `enforce_ceiling` 的账号）：7 天用量达到 `ceiling_percent` 就设为不可调度直到窗口重置再恢复，且只恢复自己关掉的账号；Fable（`7d_oi`）用量达到 `fable_ceiling_percent` 就写一条分组路由把 `fable_model_pattern` 导向其它账号，重置后撤销。不是自己写的路由一律不动，只告警。
 6. **临期抢流**（可选，`drain_hours`）：某个未被排除的订阅在这么多小时内就要重置时，写一条分组路由（`drain_model_pattern`，默认 `claude-*`）只指向该账号。sub2api 在粘性之前先看路由，所以**已有会话**也会转到它上面；它被限流时 sub2api 回落到正常的优先级选择，恢复后路由再把流量拉回来。每次切换丢一次提示缓存，抢流期间 relay 被绕过。标记了 `enforce_ceiling` 或 `drain_exempt` 的账号永远不会成为抢流目标。开启一次抢流要求剩余额度不低于 `min_urgent_headroom_percent`，避免为了几个百分点把所有活跃会话都搬走；已经由调度器开启的抢流不受此限制，会一直持续到该账号触及自身上限（未保留账号即 100%）。
 7. **重启闲置窗口**（可选，`restart_idle_windows`）：处于 `idle`、状态正常、可调度且未标记 `probe_exempt` 的订阅账号，会通过 sub2api 的账号测试接口收到一条探测消息（一句 "hi"，模型由 `probe_model` 指定，默认 `claude-haiku-4-5-20251001`）。这一条消息足以让 Anthropic 开启下一个 7 天窗口，账号一周后就能再次进入紧急池，而不是永远闲置在 relay 后面。测试接口不会回写用量采样，所以调度器把探测（连同当时看到的那个已结束窗口）记进状态文件，把窗口当作 `estimated`，直到 sub2api 采到任何更新的数据：无论是活跃窗口还是更晚结束的窗口，都会让估算作废。完全没有 7 天采样的账号也按同样方式探测。条件：账号状态正常、可调度或正被本轮解除保留、未标记 `probe_exempt`。两次探测至少间隔 `probe_cooldown_hours`；失败也会记录并在冷却后重试；每轮最多发 3 次探测，每次独立 60 秒超时。探测总是最后执行，不影响本轮排序。
@@ -80,7 +80,7 @@ sub2api v0.2.0 自己回答不了这个问题：
 
 ## 配置项
 
-见 [`deploy/config.example.json`](deploy/config.example.json)。各键含义与英文 README 的配置表一致：`base_url`、`admin_key_env`、`mode`、`group_id`、`lookahead_hours`、`min_urgent_headroom_percent`、`hysteresis_ratio`、`default_ceiling_percent`、`default_fable_ceiling_percent`、`fable_model_pattern`、`drain_hours`（默认 0 关闭）、`drain_model_pattern`、`restart_idle_windows`（默认关闭）、`probe_model`、`probe_cooldown_hours`（默认 6）、`accounts[]`（账号可加 `drain_exempt`、`probe_exempt`）。`kind` 为 `relay` 的账号（看不到内部额度的 API key 中转）永远只按基础顺序排。
+见 [`deploy/config.example.json`](deploy/config.example.json)。各键含义与英文 README 的配置表一致：`base_url`、`admin_key_env`、`mode`、`group_id`、`lookahead_hours`、`min_urgent_headroom_percent`、`hysteresis_ratio`、`default_ceiling_percent`、`default_fable_ceiling_percent`、`fable_model_pattern`、`drain_hours`（默认 0 关闭）、`drain_model_pattern`、`restart_idle_windows`（默认关闭）、`probe_model`、`probe_cooldown_hours`（默认 6）、`accounts[]`（账号可加 `drain_exempt`、`probe_exempt`、`window_max_age_hours`）。`kind` 为 `relay` 的账号（看不到内部额度的 API key 中转）永远只按基础顺序排。
 
 ## 安全边界
 

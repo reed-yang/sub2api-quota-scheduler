@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- Per-account `window_max_age_hours`. When set, a 7d sample older than that,
+  or one with no sample time, is treated as no window at all and logged as a
+  warning, so the account falls back to the base order. Unset by default,
+  which is correct for windows sub2api samples itself: those only change when
+  the account serves a request, and that request resamples them. Set it for
+  windows written by an external sync, so a stalled sync degrades to no data
+  instead of to numbers that stopped moving.
+
 ## [0.4.0] - 2026-09-09
 
 ### Added

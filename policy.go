@@ -145,6 +145,10 @@ func Evaluate(cfg *Config, snaps []AccountSnapshot, group GroupRouting, prev Sta
 	for i, a := range cfg.Accounts {
 		s := byID[a.ID]
 		s.BaseIndex = i
+		if reason := staleWindow(a, s.Win7d, now); reason != "" {
+			d.Warnings = append(d.Warnings, fmt.Sprintf("account %d (%s): %s; ranking it without a window", a.ID, a.Name, reason))
+			s.Win7d, s.WinFable = Window{State: WindowUnknown}, Window{State: WindowUnknown}
+		}
 		ceiling, fable := cfg.Ceiling(a)
 		ad := AccountDecision{ID: a.ID, Name: a.Name, Kind: a.Kind, Schedulable: s.Schedulable, Win7d: s.Win7d, WinFable: s.WinFable, Ceiling: ceiling, FableCeiling: fable, CurrentPriority: s.Priority}
 		d.Accounts = append(d.Accounts, ad)
@@ -295,6 +299,26 @@ func planProbes(cfg *Config, d *Decision, byID map[int64]AccountSnapshot, now ti
 		d.Actions = append(d.Actions, Action{Type: "probe", AccountID: a.ID, Model: cfg.ProbeModel, Reason: reason})
 		planned++
 	}
+}
+
+// staleWindow reports why an account's 7d sample is too old to rank on, or ""
+// when it is usable. Only accounts with WindowMaxAgeHours set are checked: a
+// window sub2api samples itself cannot go stale, because it only changes when
+// the account serves a request, which resamples it. A window written by an
+// external sync can, and then the numbers say the account still has quota long
+// after the sync stopped looking. Falling back to no data returns the account
+// to the base order, where sub2api's own error handling governs it.
+func staleWindow(a AccountPolicy, w Window, now time.Time) string {
+	if a.WindowMaxAgeHours <= 0 || w.State == WindowUnknown {
+		return ""
+	}
+	if w.SampledAt.IsZero() {
+		return fmt.Sprintf("7d window carries no sample time but window_max_age_hours is %.1f", a.WindowMaxAgeHours)
+	}
+	if age := now.Sub(w.SampledAt).Hours(); age > a.WindowMaxAgeHours {
+		return fmt.Sprintf("7d sample is %.1fh old, past window_max_age_hours %.1f", age, a.WindowMaxAgeHours)
+	}
+	return ""
 }
 
 // releasesReserve reports whether this decision re-enables the account.

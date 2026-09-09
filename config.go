@@ -21,6 +21,13 @@ type AccountPolicy struct {
 	// ProbeExempt keeps the account out of idle-window probes, for accounts
 	// whose owner starts the window by using it directly.
 	ProbeExempt bool `json:"probe_exempt,omitempty"`
+	// WindowMaxAgeHours bounds how old a 7d sample may be before the scheduler
+	// stops ranking on it. Zero, the default, means no bound, which is right
+	// for windows sub2api samples itself: without traffic they cannot change.
+	// Set it for accounts whose window is written by an external sync, so a
+	// stalled sync degrades to no data instead of to numbers that stopped
+	// moving.
+	WindowMaxAgeHours float64 `json:"window_max_age_hours,omitempty"`
 }
 
 // Config is the on-disk scheduler configuration.
@@ -131,6 +138,9 @@ func (c *Config) validate() error {
 		}
 		if a.Kind != "relay" && a.Kind != "subscription" {
 			return fmt.Errorf("account %d kind must be relay or subscription", a.ID)
+		}
+		if a.WindowMaxAgeHours < 0 {
+			return fmt.Errorf("account %d window_max_age_hours must not be negative", a.ID)
 		}
 		if seen[a.ID] {
 			return fmt.Errorf("duplicate account id %d", a.ID)

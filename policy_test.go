@@ -883,3 +883,104 @@ func TestSelectDrainTargetSkipsNearlyExhaustedAccount(t *testing.T) {
 		t.Fatalf("drain account %d, want ying once it has 10%% to rescue", d.DrainAccount)
 	}
 }
+
+// relayConfig makes account 9 a window-carrying account fed by an external
+// sync: it ranks like a subscription while its sample is fresh, and returns to
+// the base order as soon as the sync stalls.
+func relayConfig(maxAge float64) *Config {
+	cfg := testConfig()
+	cfg.Accounts[0].Kind = "subscription"
+	cfg.Accounts[0].ProbeExempt = true
+	cfg.Accounts[0].DrainExempt = true
+	cfg.Accounts[0].WindowMaxAgeHours = maxAge
+	return cfg
+}
+
+func sampled(w Window, at time.Time) Window { w.SampledAt = at; return w }
+
+func equalIDs(got, want []int64) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func TestSyncedWindowRanksWhileFresh(t *testing.T) {
+	cfg := relayConfig(1)
+	wins := liveWindows()
+	// 26% left over 8h outranks my-team's 84% over 29h on pressure.
+	wins[9] = [2]Window{sampled(known(74, testNow.Add(8*time.Hour)), testNow.Add(-20*time.Minute)), {State: WindowUnknown}}
+	d, err := Evaluate(cfg, snaps(cfg, wins, livePriorities()), GroupRouting{}, State{}, testNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.TargetOrder[0] != 9 {
+		t.Fatalf("order %v, want the synced account promoted on its own pressure", d.TargetOrder)
+	}
+	for _, a := range d.Accounts {
+		if a.ID == 9 && (!a.Urgent || a.HoursToReset == nil || a.Headroom != 26) {
+			t.Fatalf("synced account must rank like a subscription: %+v", a)
+		}
+	}
+	if len(d.Warnings) != 0 {
+		t.Fatalf("fresh sample must not warn: %v", d.Warnings)
+	}
+}
+
+func TestStaleSyncedWindowFallsBackToBaseOrder(t *testing.T) {
+	cfg := relayConfig(1)
+	wins := liveWindows()
+	wins[9] = [2]Window{sampled(known(74, testNow.Add(15*time.Hour)), testNow.Add(-90*time.Minute)), {State: WindowUnknown}}
+	d, err := Evaluate(cfg, snaps(cfg, wins, livePriorities()), GroupRouting{}, State{}, testNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Same order the account gets with no window at all: urgent my-team, then
+	// base order with the relay first.
+	if want := []int64{8, 9, 11, 4, 1}; !equalIDs(d.TargetOrder, want) {
+		t.Fatalf("order %v, want %v", d.TargetOrder, want)
+	}
+	for _, a := range d.Accounts {
+		if a.ID == 9 && (a.Win7d.State != WindowUnknown || a.Urgent || a.HoursToReset != nil) {
+			t.Fatalf("stale window must not rank: %+v", a)
+		}
+	}
+	if len(d.Warnings) != 1 || !strings.Contains(d.Warnings[0], "past window_max_age_hours") {
+		t.Fatalf("warnings %v, want one stale-sample warning", d.Warnings)
+	}
+}
+
+func TestSyncedWindowWithoutSampleTimeIsRejected(t *testing.T) {
+	cfg := relayConfig(1)
+	wins := liveWindows()
+	wins[9] = [2]Window{known(74, testNow.Add(15*time.Hour)), {State: WindowUnknown}}
+	d, err := Evaluate(cfg, snaps(cfg, wins, livePriorities()), GroupRouting{}, State{}, testNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.TargetOrder[0] == 9 {
+		t.Fatalf("a window with no sample time must not rank: %v", d.TargetOrder)
+	}
+	if len(d.Warnings) != 1 || !strings.Contains(d.Warnings[0], "no sample time") {
+		t.Fatalf("warnings %v", d.Warnings)
+	}
+}
+
+func TestWindowMaxAgeUnsetLeavesPassiveSamplesAlone(t *testing.T) {
+	cfg := testConfig()
+	wins := liveWindows()
+	// A four-day-old sample on a passively sampled account stays authoritative.
+	wins[8] = [2]Window{sampled(known(16, testNow.Add(29*time.Hour)), testNow.Add(-96*time.Hour)), known(23, testNow.Add(29*time.Hour))}
+	d, err := Evaluate(cfg, snaps(cfg, wins, livePriorities()), GroupRouting{}, State{}, testNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.TargetOrder[0] != 8 || len(d.Warnings) != 0 {
+		t.Fatalf("order %v warnings %v", d.TargetOrder, d.Warnings)
+	}
+}

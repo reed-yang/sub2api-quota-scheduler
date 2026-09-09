@@ -101,7 +101,15 @@ Every run (default: every five minutes):
    previous relative order unless the higher pressure exceeds the lower by
    more than `hysteresis_ratio`, so the order does not flap.
 4. **Write priorities**: final-window tier, urgent tier, then everyone else in the
-   configured base order, as priorities `1..N`. Only accounts whose live
+   configured base order, as priorities `1..N`.
+   An account with `window_max_age_hours` set is checked first: if its 7d
+   sample is older than that, or carries no sample time, the scheduler logs a
+   warning and ranks the account as if it had no window at all. Leave it unset
+   for windows sub2api samples itself — those cannot go stale, because they
+   only change when the account serves a request, which resamples them. Set it
+   when something outside the scheduler writes the window, so a stalled writer
+   degrades the account to the base order instead of leaving it ranked on
+   numbers that stopped moving. Only accounts whose live
    priority differs are written, with a body containing nothing but
    `priority`.
 5. **Enforce reserves** for accounts marked `enforce_ceiling`:
@@ -263,7 +271,7 @@ See [`deploy/config.example.json`](deploy/config.example.json).
 | `restart_idle_windows` | `false` | probe idle subscriptions so Anthropic starts their next 7-day window |
 | `probe_model` | `claude-haiku-4-5-20251001` | model used for the one-message probe |
 | `probe_cooldown_hours` | `6` | minimum gap between probe attempts on one account |
-| `accounts[]` | required | ordered list; each has `id`, `name`, `kind` (`relay` or `subscription`), optional `ceiling_percent`, `fable_ceiling_percent`, `enforce_ceiling`, `drain_exempt`, `probe_exempt` |
+| `accounts[]` | required | ordered list; each has `id`, `name`, `kind` (`relay` or `subscription`), optional `ceiling_percent`, `fable_ceiling_percent`, `enforce_ceiling`, `drain_exempt`, `probe_exempt`, `window_max_age_hours` |
 
 `relay` accounts (API-key relays with no visible quota) always stay in the
 base order. Only the listed accounts are ever read for policy or written.

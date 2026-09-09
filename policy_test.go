@@ -245,13 +245,36 @@ func TestFinalWindowPreservesPersonal95PercentReserve(t *testing.T) {
 func TestDrainConsumesUnreservedRemainderWithFableExhausted(t *testing.T) {
 	cfg := drainConfig()
 	wins := liveWindows()
-	wins[8] = [2]Window{known(99, testNow.Add(3*time.Hour)), known(100, testNow.Add(3*time.Hour))}
+	wins[8] = [2]Window{known(90, testNow.Add(3*time.Hour)), known(100, testNow.Add(3*time.Hour))}
 	d, err := Evaluate(cfg, snaps(cfg, wins, livePriorities()), GroupRouting{}, State{}, testNow)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if d.DrainAccount != 8 || d.TargetOrder[0] != 8 {
 		t.Fatalf("remaining 7d quota must stay available for other models: %+v", d)
+	}
+}
+
+// A drain the scheduler already owns keeps running to the ceiling; the entry
+// threshold only stops it from disrupting every session for a few percent.
+func TestDrainContinuesBelowEntryThresholdButDoesNotRestart(t *testing.T) {
+	cfg := drainConfig()
+	wins := liveWindows()
+	wins[8] = [2]Window{known(99, testNow.Add(3*time.Hour)), known(99, testNow.Add(3*time.Hour))}
+	live := snaps(cfg, wins, livePriorities())
+	d, err := Evaluate(cfg, live, GroupRouting{}, State{DrainAccountID: 8, DrainUntil: testNow.Add(3 * time.Hour).Unix()}, testNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.DrainAccount != 8 {
+		t.Fatalf("an owned drain must run to the ceiling, got %d", d.DrainAccount)
+	}
+	d, err = Evaluate(cfg, live, GroupRouting{}, State{}, testNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.DrainAccount != 0 {
+		t.Fatalf("drain must not start for 1%% headroom, got %d", d.DrainAccount)
 	}
 }
 
@@ -835,5 +858,28 @@ func TestEstimatedWindowCanBeDrained(t *testing.T) {
 	d, _ := Evaluate(cfg, snaps(cfg, wins, livePriorities()), GroupRouting{}, st, testNow)
 	if d.DrainAccount != 8 {
 		t.Fatalf("estimated window inside drain_hours must be drained: drain=%d actions=%+v", d.DrainAccount, d.Actions)
+	}
+}
+
+// Draining moves live sticky sessions, so it must be worth the cache misses.
+func TestSelectDrainTargetSkipsNearlyExhaustedAccount(t *testing.T) {
+	cfg := testConfig()
+	cfg.DrainHours = 24
+	wins := liveWindows()
+	wins[11] = [2]Window{known(97, testNow.Add(20*time.Hour)), known(97, testNow.Add(20*time.Hour))}
+	d, err := Evaluate(cfg, snaps(cfg, wins, livePriorities()), GroupRouting{}, State{}, testNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.DrainAccount != 0 {
+		t.Fatalf("drain account %d, want none: 3%% headroom is below min_urgent_headroom_percent", d.DrainAccount)
+	}
+	wins[11] = [2]Window{known(90, testNow.Add(20*time.Hour)), known(90, testNow.Add(20*time.Hour))}
+	d, err = Evaluate(cfg, snaps(cfg, wins, livePriorities()), GroupRouting{}, State{}, testNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.DrainAccount != 11 {
+		t.Fatalf("drain account %d, want ying once it has 10%% to rescue", d.DrainAccount)
 	}
 }

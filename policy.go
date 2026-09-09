@@ -324,7 +324,18 @@ func selectDrainTarget(cfg *Config, d *Decision, byID map[int64]AccountSnapshot,
 		}
 		ceiling, _ := cfg.Ceiling(a)
 		hours := s.Win7d.HoursToReset(now)
-		if s.Win7d.UsedPercent >= ceiling || hours <= 0 || hours > cfg.DrainHours {
+		if hours <= 0 || hours > cfg.DrainHours {
+			continue
+		}
+		if s.Win7d.UsedPercent >= ceiling {
+			continue
+		}
+		// Starting a drain installs a routing rule that moves every existing
+		// sticky session, costing a prompt-cache miss each, so it needs the same
+		// headroom the urgent tier requires. Continuing one the scheduler
+		// already owns costs nothing extra, so an account it is draining stays
+		// eligible down to its ceiling.
+		if ceiling-s.Win7d.UsedPercent < cfg.MinUrgentHeadroomPercent && d.State.DrainAccountID != a.ID {
 			continue
 		}
 		if best == nil || s.Win7d.Reset.Before(best.Win7d.Reset) || (s.Win7d.Reset.Equal(best.Win7d.Reset) && s.Win7d.UsedPercent < best.Win7d.UsedPercent) {

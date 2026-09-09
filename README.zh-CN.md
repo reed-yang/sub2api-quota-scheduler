@@ -94,6 +94,8 @@ sub2api-quota-scheduler relay-sync --config /etc/sub2api-quota-scheduler/relay-s
 
 同步是单向且只增的：绝不写上游，任何一步失败就什么都不写，于是同步停了之后样本自然过期，调度器退回基础顺序。这正是 `window_max_age_hours` 的用途，也是 `relay-sync` 在目标账号没有按这套配置声明时直接拒绝运行的原因——写到一个调度器仍当作 `relay` 的账号上会被忽略，写到一个没有时效上限的账号上则会被永远信任。上游空闲、没有新样本可抄时会报一行并以 0 退出，定时器不会每刻钟失败一次。
 
+账号的 `window_max_age_hours` 要大于 `max_sample_age_hours`，否则调度器会把同步刚写进去的窗口判为过期：跟着窗口一起写的是上游自己的采样时间，抄过来的时候可能已经好几小时了。按默认值取 `8`：同步正常时窗口一直参与排序，同步或上游安静下来后约两小时内退回基础顺序。
+
 上游密码是别人网关的真实凭据：放在 `/etc/sub2api-quota-scheduler/relay-sync.env`（0600），它只用来换 token，token 以 0600 缓存在 state 目录里复用到过期。
 
 ## 安全边界

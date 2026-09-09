@@ -314,6 +314,7 @@ pressure terms as a direct subscription. See
 | `upstream_platform` | `anthropic` | only upstream accounts of this platform are considered |
 | `upstream_group_id` | `0` (any) | only upstream accounts in this group are considered |
 | `max_sample_age_hours` | `6` | an upstream sample older than this is not copied |
+
 | `local_base_url` | `http://127.0.0.1:8080` | the instance holding the relay account |
 | `local_admin_key_env` | `SUB2API_QUOTA_SCHEDULER_ADMIN_KEY` | environment variable holding the local admin key |
 | `target_account_id` | required | the local relay account the window is written to |
@@ -327,6 +328,13 @@ the target account is configured to use it — a window written onto an account
 the scheduler still calls a `relay`, or one with no age bound, is either
 ignored or trusted forever. An idle upstream with nothing fresh to copy is
 reported and exits 0, so the timer does not fail every quarter hour.
+
+Set the account's `window_max_age_hours` above `max_sample_age_hours`, or the
+scheduler will discard windows the sync just wrote: the timestamp that travels
+with the window is the upstream's own sample time, which can already be hours
+old when it is copied. With the defaults, `8` leaves the window ranked while
+the sync is healthy and discards it within about two hours of the sync or the
+upstream going quiet.
 
 The upstream password is a real credential for someone else's gateway. Keep it
 in `/etc/sub2api-quota-scheduler/relay-sync.env` at mode 0600, and note that

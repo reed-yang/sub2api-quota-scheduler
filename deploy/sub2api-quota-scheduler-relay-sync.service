@@ -1,0 +1,22 @@
+[Unit]
+Description=sub2api-quota-scheduler relay-sync: copy an upstream sub2api's 7-day window onto the local relay account
+After=network-online.target sub2api.service
+Wants=network-online.target sub2api.service
+
+[Service]
+Type=oneshot
+DynamicUser=yes
+# Its own directory, not the scheduler's: DynamicUser derives the user from the
+# unit name, so the two units get different UIDs and cannot share a 0700
+# StateDirectory. relay-sync only needs somewhere to cache the upstream token.
+StateDirectory=sub2api-quota-scheduler-relay-sync
+# The local admin key plus the upstream login. Keep this file root-owned 0600.
+EnvironmentFile=/etc/sub2api-quota-scheduler/env
+EnvironmentFile=/etc/sub2api-quota-scheduler/relay-sync.env
+ExecStart=/opt/sub2api-quota-scheduler/sub2api-quota-scheduler relay-sync --config /etc/sub2api-quota-scheduler/relay-sync.json
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+# Unlike the scheduler, this unit must reach the upstream instance, so egress
+# is not restricted to loopback here. The scheduler unit stays loopback-only.

@@ -80,11 +80,26 @@ sub2api v0.2.0 自己回答不了这个问题：
 
 ## 配置项
 
-见 [`deploy/config.example.json`](deploy/config.example.json)。各键含义与英文 README 的配置表一致：`base_url`、`admin_key_env`、`mode`、`group_id`、`lookahead_hours`、`min_urgent_headroom_percent`、`hysteresis_ratio`、`default_ceiling_percent`、`default_fable_ceiling_percent`、`fable_model_pattern`、`drain_hours`（默认 0 关闭）、`drain_model_pattern`、`restart_idle_windows`（默认关闭）、`probe_model`、`probe_cooldown_hours`（默认 6）、`accounts[]`（账号可加 `drain_exempt`、`probe_exempt`、`window_max_age_hours`）。`kind` 为 `relay` 的账号（看不到内部额度的 API key 中转）永远只按基础顺序排。
+见 [`deploy/config.example.json`](deploy/config.example.json)。各键含义与英文 README 的配置表一致：`base_url`、`admin_key_env`、`mode`、`group_id`、`lookahead_hours`、`min_urgent_headroom_percent`、`hysteresis_ratio`、`default_ceiling_percent`、`default_fable_ceiling_percent`、`fable_model_pattern`、`drain_hours`（默认 0 关闭）、`drain_model_pattern`、`restart_idle_windows`（默认关闭）、`probe_model`、`probe_cooldown_hours`（默认 6）、`accounts[]`（账号可加 `drain_exempt`、`probe_exempt`、`window_max_age_hours`）。`kind` 为 `relay` 的账号（看不到内部额度的 API key 中转）永远只按基础顺序排；由 relay-sync 喂窗口的中转账号是例外，它按 `subscription` 声明并设 `window_max_age_hours`。
+
+## relay-sync
+
+中转账号是指向另一个网关的 API key，sub2api 看不到它背后的订阅窗口，调度器只能按基础顺序排它。如果那个上游本身是一个你有管理权限的 sub2api，`relay-sync` 可以补上这份数据：
+
+```sh
+sub2api-quota-scheduler relay-sync --config /etc/sub2api-quota-scheduler/relay-sync.json
+```
+
+它登录上游 admin API，在能服务这把 key 的账号里挑 7 天剩余额度最多的那个，把窗口合并进本地中转账号的 `extra`，之后调度器就能用和直连订阅一样的压力口径排它。配置项见英文 README 与 [`deploy/relay-sync.example.json`](deploy/relay-sync.example.json)。
+
+同步是单向且只增的：绝不写上游，任何一步失败就什么都不写，于是同步停了之后样本自然过期，调度器退回基础顺序。这正是 `window_max_age_hours` 的用途，也是 `relay-sync` 在目标账号没有按这套配置声明时直接拒绝运行的原因——写到一个调度器仍当作 `relay` 的账号上会被忽略，写到一个没有时效上限的账号上则会被永远信任。上游空闲、没有新样本可抄时会报一行并以 0 退出，定时器不会每刻钟失败一次。
+
+上游密码是别人网关的真实凭据：放在 `/etc/sub2api-quota-scheduler/relay-sync.env`（0600），它只用来换 token，token 以 0600 缓存在 state 目录里复用到过期。
 
 ## 安全边界
 
 - 读：`GET /api/v1/admin/accounts?group=<id>`、`GET /api/v1/admin/groups/<id>`。
+- `relay-sync` 另外读本地 `GET /api/v1/admin/accounts/<id>`，以及上游的 `POST /api/v1/auth/login` 和 `GET /api/v1/admin/accounts`；唯一的写是 `POST /api/v1/admin/accounts/bulk-update`，只带一个账号 id 和三个 `passive_usage_*` 键（合并而非替换 `extra`），写完回读确认，没落上就失败。它不写上游，不跟随 HTTP 重定向（否则登录请求体会被重放到别的主机），报错只带状态码、不带可能回显凭据的响应体。
 - 写（仅 apply）：`PUT /api/v1/admin/accounts/<id>` 只带 `priority`；`POST /api/v1/admin/accounts/<id>/schedulable`；`PUT /api/v1/admin/groups/<id>` 只带 `model_routing` 与 `model_routing_enabled`。绝不发送 `extra`、`credentials`、`group_ids`、`status`。
 - 开启 `restart_idle_windows` 后：`POST /api/v1/admin/accounts/<id>/test` 只带 `model_id`，每个账号每个冷却期最多一次、每轮最多三次，且只针对上次采样显示已经结束的窗口（或完全没有采样的账号）。这会通过该账号真实发送一条消息（几百 token）。sub2api 侧的副作用：测试成功会清掉该账号的限流记录；上游返回 403 时 sub2api 会把账号状态置为 `error`，从所有调度中移除，调度器之后既不会再探测也不会恢复它。
 - 任何读取失败或账号缺失都会在写入前中止。

@@ -1,0 +1,11 @@
+[Unit]
+Description=Run sub2api-quota-scheduler relay-sync every fifteen minutes
+
+[Timer]
+OnBootSec=3min
+OnCalendar=*:4/15
+RandomizedDelaySec=30s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

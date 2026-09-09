@@ -26,6 +26,11 @@ func main() {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
 		}
+	case "relay-sync":
+		if err := relaySyncCommand(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
 	default:
 		usage()
 		os.Exit(2)
@@ -33,7 +38,9 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: sub2api-quota-scheduler run|plan --config <path> [--state-dir <dir>] [--now RFC3339] | version")
+	fmt.Fprintln(os.Stderr, "usage: sub2api-quota-scheduler run|plan --config <path> [--state-dir <dir>] [--now RFC3339]")
+	fmt.Fprintln(os.Stderr, "       sub2api-quota-scheduler relay-sync --config <path> [--state-dir <dir>]")
+	fmt.Fprintln(os.Stderr, "       sub2api-quota-scheduler version")
 }
 
 func command(name string, args []string) error {

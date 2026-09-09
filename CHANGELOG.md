@@ -4,6 +4,31 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.4.2] - 2026-09-09
+
+### Added
+
+- `relay-sync` subcommand and optional systemd units. It reads a 7d window from
+  an upstream sub2api instance's admin API and merges it onto a local relay
+  account, so a relay whose quota sub2api cannot see can be ranked like a
+  subscription. One-way and additive: it never writes to the upstream, writes
+  nothing at all on any failure, reads the local write back to confirm it
+  landed, and refuses to run unless the target account is declared
+  `subscription` with `window_max_age_hours` and `probe_exempt` — the three
+  settings without which the scheduler would ignore or over-trust the window.
+  An upstream with nothing fresh to copy exits 0 rather than failing the timer.
+
+### Fixed
+
+- `window_max_age_hours` only demoted the account in the ranking. Reserve
+  enforcement, drain selection and probe planning all re-read the account map
+  and still saw the frozen window, so a stale sample could still install
+  routing or send a probe. The discard now reaches every stage, and an account
+  whose window this run discarded is never probed.
+- A 7d sample dated in the future never aged out, leaving the account
+  permanently fresh; anything past five minutes of clock drift is now treated
+  as unusable.
+
 ## [0.4.1] - 2026-09-09
 
 ### Added

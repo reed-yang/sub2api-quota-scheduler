@@ -46,6 +46,24 @@ if [ ! -f "$ETC/env" ]; then
   echo "wrote empty $ETC/env; fill in the admin key" >&2
 fi
 install -m 0644 "$STAGE/$NAME.service" "$STAGE/$NAME.timer" /etc/systemd/system/
+# relay-sync is optional: install its units when staged, but never enable them.
+# It needs $ETC/relay-sync.json and $ETC/relay-sync.env, which hold an upstream
+# login, so enabling it is a deliberate step the operator takes afterwards.
+for f in $NAME-relay-sync.service $NAME-relay-sync.timer; do
+  [ -f "$STAGE/$f" ] && install -m 0644 "$STAGE/$f" /etc/systemd/system/
+done
+if [ -f "$STAGE/$NAME-relay-sync.service" ]; then
+  if [ ! -f "$ETC/relay-sync.env" ]; then
+    (umask 077; printf 'RELAY_SYNC_UPSTREAM_EMAIL=\nRELAY_SYNC_UPSTREAM_PASSWORD=\n' > "$ETC/relay-sync.env")
+    echo "wrote empty $ETC/relay-sync.env; fill in the upstream login" >&2
+  fi
+  # $ETC is world-readable, so the file holding the login must not be.
+  chmod 0600 "$ETC/relay-sync.env"
+  if [ ! -f "$ETC/relay-sync.json" ] && [ -f "$STAGE/relay-sync.example.json" ]; then
+    install -m 0644 "$STAGE/relay-sync.example.json" "$ETC/relay-sync.json"
+    echo "installed $ETC/relay-sync.json from the example; edit it before enabling the timer" >&2
+  fi
+fi
 systemctl daemon-reload
 if [ "${SUB2API_QS_NO_ENABLE:-0}" = 1 ]; then
   echo "units installed; timer left disabled (SUB2API_QS_NO_ENABLE=1)"

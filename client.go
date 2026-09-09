@@ -108,6 +108,14 @@ func (c *AdminClient) ListGroupAccounts(ctx context.Context, groupID int64) ([]A
 	return page.Items, nil
 }
 
+// GetAccount returns one account by id. Only the fields APIAccount declares are
+// kept, so the credentials the route also returns are never carried further.
+func (c *AdminClient) GetAccount(ctx context.Context, id int64) (APIAccount, error) {
+	var a APIAccount
+	err := c.do(ctx, http.MethodGet, fmt.Sprintf("/api/v1/admin/accounts/%d", id), nil, &a)
+	return a, err
+}
+
 // GetGroup returns the group's routing state.
 func (c *AdminClient) GetGroup(ctx context.Context, id int64) (APIGroup, error) {
 	var g APIGroup

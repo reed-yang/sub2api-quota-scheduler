@@ -3,3 +3,4 @@ config.json
 env
 state.json
 decisions.jsonl
+/sub2api-quota-scheduler

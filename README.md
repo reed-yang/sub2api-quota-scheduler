@@ -274,7 +274,9 @@ See [`deploy/config.example.json`](deploy/config.example.json).
 | `accounts[]` | required | ordered list; each has `id`, `name`, `kind` (`relay` or `subscription`), optional `ceiling_percent`, `fable_ceiling_percent`, `enforce_ceiling`, `drain_exempt`, `probe_exempt`, `window_max_age_hours` |
 
 `relay` accounts (API-key relays with no visible quota) always stay in the
-base order. Only the listed accounts are ever read for policy or written.
+base order. Only the listed accounts are ever read for policy or written. A
+relay fed by [`relay-sync`](#relay-sync) is the exception: it carries a real
+window, so it is declared `subscription` with `window_max_age_hours` set.
 
 ## Commands
 
@@ -288,9 +290,60 @@ sub2api-quota-scheduler version
 a future point in time against live data. `--state-dir` defaults to systemd's
 `$STATE_DIRECTORY`.
 
+### relay-sync
+
+A relay account is an API key pointing at another gateway, so sub2api never
+sees the subscription window behind it and the scheduler can only rank the
+relay by base order. When that upstream is itself a sub2api instance you can
+administer, `relay-sync` closes the gap:
+
+```sh
+sub2api-quota-scheduler relay-sync --config /etc/sub2api-quota-scheduler/relay-sync.json
+```
+
+It logs into the upstream admin API, picks the account with the most 7d
+headroom among those that can serve the key, and merges that window into the
+local relay account's `extra`. The scheduler then ranks the relay on the same
+pressure terms as a direct subscription. See
+[`deploy/relay-sync.example.json`](deploy/relay-sync.example.json).
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `upstream_base_url` | required | the other sub2api instance; must be https unless it is loopback |
+| `upstream_email_env` / `upstream_password_env` | required | environment variables holding the upstream login, kept in a root-only `EnvironmentFile` |
+| `upstream_platform` | `anthropic` | only upstream accounts of this platform are considered |
+| `upstream_group_id` | `0` (any) | only upstream accounts in this group are considered |
+| `max_sample_age_hours` | `6` | an upstream sample older than this is not copied |
+| `local_base_url` | `http://127.0.0.1:8080` | the instance holding the relay account |
+| `local_admin_key_env` | `SUB2API_QUOTA_SCHEDULER_ADMIN_KEY` | environment variable holding the local admin key |
+| `target_account_id` | required | the local relay account the window is written to |
+| `scheduler_config_path` | `/etc/sub2api-quota-scheduler/config.json` | checked before each run; `""` disables |
+
+The sync is one-way and additive: it never writes to the upstream, and on any
+failure it writes nothing, so a stalled sync leaves the sample to age out and
+the scheduler falls back to the base order. That fallback is what
+`window_max_age_hours` is for, and it is why `relay-sync` refuses to run unless
+the target account is configured to use it — a window written onto an account
+the scheduler still calls a `relay`, or one with no age bound, is either
+ignored or trusted forever. An idle upstream with nothing fresh to copy is
+reported and exits 0, so the timer does not fail every quarter hour.
+
+The upstream password is a real credential for someone else's gateway. Keep it
+in `/etc/sub2api-quota-scheduler/relay-sync.env` at mode 0600, and note that
+the run needs it only to mint a token, which is cached at mode 0600 under the
+state directory and reused until it expires.
+
 ## Safety properties
 
 - Reads: `GET /api/v1/admin/accounts?group=<id>` and `GET /api/v1/admin/groups/<id>`.
+- `relay-sync` additionally reads `GET /api/v1/admin/accounts/<id>` locally and,
+  on the upstream, `POST /api/v1/auth/login` and `GET /api/v1/admin/accounts`.
+  Its only write is `POST /api/v1/admin/accounts/bulk-update` carrying one
+  account id and three `passive_usage_*` keys, which merges rather than
+  replaces `extra`; the write is read back and the run fails if it did not
+  land. It never writes to the upstream. HTTP redirects are not followed, so a
+  redirect can never replay the login body to another host, and failures report
+  the status code only, never a response body that could echo the credential.
 - Writes, apply mode only: `PUT /api/v1/admin/accounts/<id>` with
   `{"priority": n}`, `POST /api/v1/admin/accounts/<id>/schedulable`, and
   `PUT /api/v1/admin/groups/<id>` with `model_routing` and

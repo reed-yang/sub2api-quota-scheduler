@@ -1,0 +1,12 @@
+{
+  "upstream_base_url": "https://gateway.example.com",
+  "upstream_email_env": "RELAY_SYNC_UPSTREAM_EMAIL",
+  "upstream_password_env": "RELAY_SYNC_UPSTREAM_PASSWORD",
+  "upstream_platform": "anthropic",
+  "upstream_group_id": 1,
+  "max_sample_age_hours": 6,
+  "local_base_url": "http://127.0.0.1:8080",
+  "local_admin_key_env": "SUB2API_QUOTA_SCHEDULER_ADMIN_KEY",
+  "target_account_id": 9,
+  "scheduler_config_path": "/etc/sub2api-quota-scheduler/config.json"
+}

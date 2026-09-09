@@ -4,6 +4,30 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- A highest-priority tier for active, schedulable subscriptions whose 7d
+  window resets within five hours and still has usable quota. Earlier reset
+  wins, then greater headroom, without pressure hysteresis or a minimum
+  unused percentage. Decisions expose `final_window` and explain promotion.
+
+### Changed
+
+- Starting a drain now requires at least `min_urgent_headroom_percent` of
+  headroom, so a nearly exhausted account cannot move every live sticky
+  session for a few remaining percent. A drain the scheduler already owns is
+  unaffected and still runs to the account's ceiling.
+
+### Fixed
+
+- Unreserved accounts now use 100% capacity for ranking and drain selection;
+  the default 95% reserve applies only to `enforce_ceiling` accounts. Explicit
+  personal 7d/Fable reserves remain effective in the final five hours.
+- Expired deadlines cannot enter urgency or drain selection, and inactive
+  accounts cannot become drain targets.
+
 ## [0.3.1] - 2026-09-06
 
 ### Fixed

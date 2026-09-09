@@ -86,13 +86,21 @@ Every run (default: every five minutes):
    - `unknown`: fields missing (sub2api clears them at each new 5-hour window
      until the next response is sampled); the account falls back to the base
      order and never triggers a reserve action.
-3. **Rank the urgent tier**: subscriptions whose reset is within
+3. **Rank the final-window tier first**: active, schedulable subscriptions
+   with positive 7d headroom and a reset within the next **five hours** go
+   ahead of every other account, even with less than 5% left. Earlier reset
+   wins, then greater headroom, then base order. This tier is independent of
+   lookahead, minimum urgent headroom, and hysteresis. Unreserved accounts
+   use their full 100% capacity; only `enforce_ceiling` accounts use reserve
+   ceilings. A full Fable sub-window does not disqualify the remaining 7d
+   capacity for Opus and other models.
+   **Then rank the urgent tier**: subscriptions whose reset is within
    `lookahead_hours` and whose headroom below their ceiling is at least
    `min_urgent_headroom_percent`, ordered by
    `pressure = headroom / hours_to_reset`. Two urgent accounts keep their
    previous relative order unless the higher pressure exceeds the lower by
    more than `hysteresis_ratio`, so the order does not flap.
-4. **Write priorities**: urgent tier first, then everyone else in the
+4. **Write priorities**: final-window tier, urgent tier, then everyone else in the
    configured base order, as priorities `1..N`. Only accounts whose live
    priority differs are written, with a body containing nothing but
    `priority`.
@@ -113,7 +121,11 @@ Every run (default: every five minutes):
    sub2api falls back to normal priority selection, and the routing pulls
    traffic back as soon as it recovers. Each switch costs one prompt-cache
    miss, and relays are bypassed while draining. Accounts with
-   `enforce_ceiling` or `drain_exempt` are never drained.
+   `enforce_ceiling` or `drain_exempt` are never drained. Starting a drain
+   requires at least `min_urgent_headroom_percent` left, so a nearly exhausted
+   account cannot move every live session for a few percent; once the
+   scheduler owns a drain it keeps it until that account reaches its ceiling,
+   which for unreserved accounts is 100%.
 7. **Restart idle windows** (optional, `restart_idle_windows`): an `idle`
    subscription that is active, schedulable, and not `probe_exempt` gets one
    probe through sub2api's account test endpoint: a single "hi" message with
@@ -137,6 +149,31 @@ Everything except the reserve and drain mode is soft: it only changes where
 **new** sessions land. sub2api's sticky-session logic keeps existing sessions on their account,
 and its own rate-limit and threshold handling still applies on top.
 
+### Opus subagents and sticky sessions
+
+Changing models does not necessarily create a new sticky session. sub2api
+extracts the session ID from `metadata.user_id`; the binding is scoped to the
+group and session, not the model or subagent ID. If an Opus subagent shares
+its Fable parent's session ID, an eligible sticky account wins over account
+priority. A different session ID without an existing binding uses normal
+selection, including priority.
+
+Model routing can override that binding when the bound account is outside
+the routed candidate list. To direct Opus traffic to expiring capacity,
+existing drain mode can be configured with `drain_hours: 5` and
+`drain_model_pattern: "claude-opus-*"`. This also affects existing Opus
+sessions. Routing with multiple candidates still honors a sticky account
+inside that list, so merely listing the expiring account first does not
+force a switch. When routed accounts are unavailable, sub2api falls back.
+
+Fable-only exhaustion (`7d_oi`) must be handled as a model-level limit by
+sub2api for other models to remain available. An account-wide disable or
+shared 5h/7d limit still blocks Opus. The scheduler does not override those
+limits. Routing can update the shared sticky binding, so an Opus-only rule
+does not guarantee the parent's next Fable request stays on its old account.
+Avoid overlapping wildcard routing rules: the inspected sub2api matcher
+does not guarantee that the more specific wildcard wins.
+
 ### Worked example
 
 Five accounts, base order `relay > sub-a > sub-b > team-plan > personal-max`,
@@ -144,7 +181,7 @@ Five accounts, base order `relay > sub-a > sub-b > team-plan > personal-max`,
 
 | Account | 7d used | Resets in | Headroom | Pressure | Result |
 | --- | ---: | ---: | ---: | ---: | --- |
-| team-plan | 25% | 21 h | 70 | 3.36 | urgent, priority 1 |
+| team-plan | 25% | 21 h | 75 | 3.57 | urgent, priority 1 |
 | personal-max | 35% | 72 h | 25 | 0.35 | urgent, priority 2 |
 | relay | n/a | n/a | | | base, priority 3 |
 | sub-a | 24% | 159 h | | | base, priority 4 |
@@ -218,8 +255,8 @@ See [`deploy/config.example.json`](deploy/config.example.json).
 | `lookahead_hours` | `72` | how early an expiring window becomes urgent |
 | `min_urgent_headroom_percent` | `5` | minimum unused percent worth promoting for |
 | `hysteresis_ratio` | `0.2` | relative pressure gap needed to reorder two urgent accounts |
-| `default_ceiling_percent` | `95` | 7d ceiling used for headroom when an account sets none |
-| `default_fable_ceiling_percent` | `95` | `7d_oi` ceiling used when an account sets none |
+| `default_ceiling_percent` | `95` | default 7d reserve for `enforce_ceiling` accounts; unreserved accounts use 100% |
+| `default_fable_ceiling_percent` | `95` | default `7d_oi` reserve for `enforce_ceiling` accounts; unreserved accounts use 100% |
 | `fable_model_pattern` | `claude-fable-*` | routing pattern installed for the Fable reserve |
 | `drain_hours` | `0` (off) | drain mode: route everything to a subscription that resets within this many hours |
 | `drain_model_pattern` | `claude-*` | routing pattern installed while draining |
